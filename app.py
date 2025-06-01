@@ -1,4 +1,3 @@
-!pip install yfinance streamlit requests
 
 import yfinance as yf
 import requests
