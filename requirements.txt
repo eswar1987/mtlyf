@@ -2,3 +2,4 @@ streamlit
 yfinance
 huggingface_hub
 pandas
+python-dotenv
