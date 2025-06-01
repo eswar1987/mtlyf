@@ -3,14 +3,10 @@ import yfinance as yf
 from huggingface_hub import InferenceClient
 import pandas as pd
 import time
-import re
-import logging
 import requests
+import re
 
-# Setup logging
-logging.basicConfig(level=logging.INFO)
-
-# === Secrets / Tokens ===
+# === Embed secrets directly (replace with your tokens or better use env variables) ===
 HF_API_TOKEN = "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"
 TELEGRAM_BOT_TOKEN = "7842285230:AAFcisrfFg40AqYjvrGaiq984DYeEu3p6hY"
 TELEGRAM_CHAT_ID = "7581145756"
@@ -45,201 +41,170 @@ PENNY_STOCKS = [
 ]
 
 # === Helper Functions ===
-
 def fetch_stock_data(ticker):
     try:
         stock = yf.Ticker(ticker)
         info = stock.info
-        price = info.get('regularMarketPrice') or info.get('previousClose')
-        volume = info.get('volume')
-        return {"price": price, "volume": volume}
+        return {
+            "price": info.get('regularMarketPrice') or info.get('previousClose'),
+            "volume": info.get('volume')
+        }
     except Exception as e:
-        logging.error(f"Fetch data error for {ticker}: {e}")
+        print(f"fetch_stock_data error for {ticker}: {e}")
         return {"price": None, "volume": None}
 
-def call_hf_model_price(ticker, retries=3):
-    for _ in range(retries):
-        try:
-            output = client.text_generation(MODELS["price_prediction"], ticker)
-            if isinstance(output, dict):
-                text = output.get("generated_text", "")
+def call_hf_model_price(ticker):
+    try:
+        output = client.text_generation(MODELS["price_prediction"], ticker)
+        text_output = output if isinstance(output, str) else output.get('generated_text', '')
+        
+        numbers = re.findall(r"\d+\.\d+", text_output)
+        if numbers:
+            return float(numbers[0])
+        else:
+            int_numbers = re.findall(r"\d+", text_output)
+            if int_numbers:
+                return float(int_numbers[0])
             else:
-                text = output
-            logging.info(f"Price prediction output for {ticker}: {text}")
-            numbers = re.findall(r"\d+\.\d+", text)
-            if numbers:
-                price = float(numbers[0])
-                if price > 0:
-                    return price
-            time.sleep(1)
-        except Exception as e:
-            logging.error(f"Price prediction error for {ticker}: {e}")
-    return None
+                return "N/A"
+    except Exception as e:
+        print(f"call_hf_model_price error for {ticker}: {e}")
+        return "N/A"
 
-def call_hf_model_sentiment(ticker, retries=3):
-    for _ in range(retries):
-        try:
-            output = client.text_classification(MODELS["news_sentiment"], ticker)
-            if output and isinstance(output, list) and "label" in output[0]:
-                sentiment = output[0]["label"]
-                logging.info(f"Sentiment output for {ticker}: {sentiment}")
-                return sentiment
-            time.sleep(1)
-        except Exception as e:
-            logging.error(f"Sentiment error for {ticker}: {e}")
-    return "Neutral"
+def call_hf_model_sentiment(ticker):
+    try:
+        output = client.text_classification(MODELS["news_sentiment"], ticker)
+        if output and isinstance(output, list) and "label" in output[0]:
+            return output[0]["label"]
+        return "N/A"
+    except Exception as e:
+        print(f"call_hf_model_sentiment error for {ticker}: {e}")
+        return "N/A"
 
-def call_hf_model_buy(ticker, retries=3):
-    prompt = f"Should I buy {ticker} stock? One word answer."
-    for _ in range(retries):
-        try:
-            output = client.text_generation(MODELS["buy_recommendation"], prompt)
-            if isinstance(output, dict):
-                text = output.get("generated_text", "")
-            else:
-                text = output
-            logging.info(f"Buy recommendation output for {ticker}: {text}")
-            match = re.search(r"\b(yes|no|buy|hold|sell|strong buy|strong sell)\b", text, re.I)
-            if match:
-                answer = match.group(0).lower()
-                if answer in ["yes", "buy", "strong buy"]:
-                    return "Yes"
-                else:
-                    return "No"
-            time.sleep(1)
-        except Exception as e:
-            logging.error(f"Buy recommendation error for {ticker}: {e}")
-    return "No"
+def call_hf_model_buy(ticker):
+    try:
+        prompt = f"Should I buy {ticker} stock? One word answer."
+        output = client.text_generation(MODELS["buy_recommendation"], prompt)
+        text_output = output if isinstance(output, str) else output.get('generated_text', '')
+        first_word = text_output.strip().split()[0].lower()
+        if first_word in ["yes", "no", "maybe"]:
+            return first_word.capitalize()
+        else:
+            return "N/A"
+    except Exception as e:
+        print(f"call_hf_model_buy error for {ticker}: {e}")
+        return "N/A"
 
 def calc_stop_loss(price):
-    if isinstance(price, (int, float)):
-        return round(price * 0.95, 2)
-    return None
-
-def is_strong_signal(pred_price, current_price, buy_recommendation):
     try:
-        if pred_price is not None and current_price is not None and buy_recommendation:
-            return (pred_price > current_price) and (buy_recommendation.lower() == "yes")
-    except:
-        return False
-    return False
+        return round(price * 0.95, 2) if isinstance(price, (int, float)) else None
+    except Exception as e:
+        print(f"calc_stop_loss error: {e}")
+        return None
 
-@st.cache_data(show_spinner=False)
 def process_sector(tickers):
     results = []
     for ticker in tickers:
         stock = fetch_stock_data(ticker)
-        if not stock or stock['price'] is None:
+        if stock['price'] is None:
             continue
 
         pred_price = call_hf_model_price(ticker)
         sentiment = call_hf_model_sentiment(ticker)
         buy = call_hf_model_buy(ticker)
         stop_loss = calc_stop_loss(stock['price'])
-        strong_signal = "✅" if is_strong_signal(pred_price, stock['price'], buy) else ""
+
+        strong_signal = ""
+        if (isinstance(pred_price, float) and pred_price > stock['price'] and buy.lower() == "yes"):
+            strong_signal = "✅"
 
         results.append({
             "Ticker": ticker,
             "Price": round(stock['price'], 2),
-            "Volume": stock['volume'] or 0,
-            "Predicted Price": round(pred_price, 2) if pred_price is not None else "N/A",
+            "Volume": stock['volume'],
+            "Predicted Price": pred_price,
             "Sentiment": sentiment,
             "Buy Recommendation": buy,
             "Stop Loss": stop_loss,
             "Strong Signal": strong_signal
         })
 
-        time.sleep(0.5)  # To avoid rate limits
+        time.sleep(1)  # be kind to API
 
     return results
+
+def style_dataframe(df):
+    def highlight_volume(val):
+        if val == df['Volume'].max():
+            return 'background-color: lightblue; font-weight: bold;'
+        return ''
+
+    def highlight_buy(val):
+        if val == "Yes":
+            return 'color: green; font-weight: bold;'
+        return ''
+
+    def highlight_strong_signal(val):
+        if val == "✅":
+            return 'background-color: #d4edda; font-weight: bold;'
+        return ''
+
+    styled = df.style.applymap(highlight_volume, subset=['Volume']) \
+                     .applymap(highlight_buy, subset=['Buy Recommendation']) \
+                     .applymap(highlight_strong_signal, subset=['Strong Signal'])
+    return styled
 
 def send_telegram_message(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     params = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
-    try:
-        response = requests.get(url, params=params)
-        return response.status_code == 200
-    except Exception as e:
-        logging.error(f"Telegram send error: {e}")
-        return False
+    return requests.get(url, params=params).status_code == 200
 
 # === Streamlit UI ===
+st.set_page_config(page_title="Stock Dashboard", layout="wide")
+st.title("📊 Sector-wise Stock Dashboard with LLM Predictions")
 
-st.set_page_config(page_title="Stock Sector Dashboard", layout="wide")
+sectors = list(ETF_SECTORS.keys()) + ["Penny Stocks"]
+sector = st.sidebar.selectbox("Select Sector", sectors)
 
-st.title("📊 Stock Dashboard with AI Signals")
+tickers = PENNY_STOCKS if sector == "Penny Stocks" else ETF_SECTORS[sector]
 
-sector = st.sidebar.selectbox("Select Sector", options=list(ETF_SECTORS.keys()))
+with st.spinner(f"Processing {sector}..."):
+    data = process_sector(tickers)
 
-st.sidebar.markdown("## Info")
-st.sidebar.write("Data refreshed with caching and HuggingFace model calls.")
-
-# Process selected sector
-with st.spinner(f"Fetching and processing {sector} data..."):
-    data = process_sector(ETF_SECTORS[sector])
+if not data:
+    st.warning("No data found.")
+else:
     df = pd.DataFrame(data)
 
-if df.empty:
-    st.warning("No data available for selected sector.")
-    st.stop()
+    # Show only Buy Recommendations on top
+    buy_df = df[df["Buy Recommendation"] == "Yes"]
 
-# Summary: Only Buy Recommendations count on top
-buy_yes = df[df["Buy Recommendation"] == "Yes"].shape[0]
-buy_no = df[df["Buy Recommendation"] == "No"].shape[0]
-
-col1, col2 = st.columns(2)
-col1.metric("🟢 Buy Recommendations", buy_yes)
-col2.metric("🔴 Not Buy", buy_no)
-
-# Style function for table
-def highlight_volume(val):
-    if val > 10_000_000:
-        color = 'lightgreen'
-    elif val > 1_000_000:
-        color = 'lightyellow'
+    st.subheader(f"Stocks Recommended to Buy in {sector} Sector")
+    if not buy_df.empty:
+        st.dataframe(style_dataframe(buy_df), height=400)
     else:
-        color = 'lightcoral'
-    return f'background-color: {color}'
+        st.write("No Buy Recommendations currently.")
 
-def highlight_strong_signal(val):
-    if val == "✅":
-        return "background-color: #90ee90; font-weight: bold; color: green"
-    return ""
+    st.subheader(f"All Stocks in {sector} Sector")
+    st.dataframe(style_dataframe(df), height=600)
 
-def highlight_buy_rec(val):
-    if val == "Yes":
-        return "color: green; font-weight: bold"
-    elif val == "No":
-        return "color: red; font-weight: bold"
-    else:
-        return ""
+    st.download_button(
+        "📥 Download CSV",
+        df.to_csv(index=False).encode('utf-8'),
+        f"{sector}_stocks.csv",
+        "text/csv"
+    )
 
-# Apply styling
-styled_df = (
-    df.style
-    .applymap(highlight_buy_rec, subset=["Buy Recommendation"])
-    .applymap(highlight_strong_signal, subset=["Strong Signal"])
-    .applymap(highlight_volume, subset=["Volume"])
-    .format({
-        "Price": "${:,.2f}",
-        "Predicted Price": lambda x: f"${x:.2f}" if isinstance(x, (float,int)) else x,
-        "Stop Loss": lambda x: f"${x:.2f}" if isinstance(x, (float,int)) else x,
-        "Volume": "{:,}"
-    })
-    .set_properties(subset=["Ticker"], **{'font-weight': 'bold'})
-    .set_table_styles([
-        {'selector': 'th', 'props': [('background-color', '#f0f0f0'), ('color', '#333'), ('font-weight', 'bold')]},
-        {'selector': 'td', 'props': [('text-align', 'center')]}
-    ])
-)
-
-st.dataframe(styled_df, height=650)
-
-# Optional: Button to send summary to Telegram
-if st.button("Send Buy Summary to Telegram"):
-    message = f"*Buy Recommendations in {sector} Sector:*\nYes: {buy_yes}\nNo: {buy_no}"
-    if send_telegram_message(message):
-        st.success("Telegram message sent!")
-    else:
-        st.error("Failed to send Telegram message.")
+    if st.button("🚀 Send to Telegram"):
+        msg = f"*{sector} Sector Overview*\n\n"
+        for row in data:
+            msg += (
+                f"{row['Ticker']}: Price ${row['Price']}, Predicted ${row['Predicted Price']}, "
+                f"Sentiment: {row['Sentiment']}, Buy: {row['Buy Recommendation']}, "
+                f"Stop Loss: ${row['Stop Loss']}, Signal: {row['Strong Signal']}\n"
+            )
+        if send_telegram_message(msg):
+            st.success("Sent to Telegram!")
+        else:
+            st.error("Failed to send message.")
 
