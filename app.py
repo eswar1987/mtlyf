@@ -5,7 +5,8 @@ import pandas as pd
 import time
 import requests
 import re
-from streamlit_autorefresh import st_autorefresh
+
+# Install matplotlib if missing: pip install matplotlib
 
 # === Embed secrets directly ===
 HF_API_TOKEN = "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"
@@ -42,6 +43,7 @@ PENNY_STOCKS = [
 ]
 
 # === Helper Functions ===
+@st.cache_data(show_spinner=False)
 def fetch_stock_data(ticker):
     try:
         stock = yf.Ticker(ticker)
@@ -53,134 +55,160 @@ def fetch_stock_data(ticker):
     except:
         return {"price": None, "volume": None}
 
+@st.cache_data(show_spinner=False)
 def call_hf_model_price(ticker):
     try:
         output = client.text_generation(MODELS["price_prediction"], ticker)
         numbers = re.findall(r"\d+\.\d+", output)
-        return float(numbers[0]) if numbers else "N/A"
+        return float(numbers[0]) if numbers else None
     except:
-        return "Error"
+        return None
 
+@st.cache_data(show_spinner=False)
 def call_hf_model_sentiment(ticker):
     try:
-        return client.text_classification(MODELS["news_sentiment"], ticker)[0]["label"]
+        result = client.text_classification(MODELS["news_sentiment"], ticker)
+        if result and len(result) > 0:
+            return result[0]["label"]
+        else:
+            return "N/A"
     except:
-        return "Error"
+        return "N/A"
 
+@st.cache_data(show_spinner=False)
 def call_hf_model_buy(ticker):
     try:
         prompt = f"Should I buy {ticker} stock? One word answer."
         output = client.text_generation(MODELS["buy_recommendation"], prompt)
-        return output.strip().split()[0]
+        # Extract first word and lowercase it for consistency
+        answer = output.strip().split()[0].lower()
+        if answer in ["yes", "no"]:
+            return answer.capitalize()
+        return "N/A"
     except:
-        return "Error"
+        return "N/A"
 
 def calc_stop_loss(price):
     return round(price * 0.95, 2) if isinstance(price, (int, float)) else None
 
+@st.cache_data(show_spinner=False)
 def process_sector(tickers):
     results = []
     for ticker in tickers:
         stock = fetch_stock_data(ticker)
-        if stock['price'] is None:
+        price = stock.get('price')
+        volume = stock.get('volume')
+
+        if price is None:
+            # Skip tickers with no price data
             continue
 
         pred_price = call_hf_model_price(ticker)
         sentiment = call_hf_model_sentiment(ticker)
         buy = call_hf_model_buy(ticker)
-        stop_loss = calc_stop_loss(stock['price'])
+        stop_loss = calc_stop_loss(price)
+
+        strong_signal = ""
+        if (pred_price is not None and pred_price > price) and (buy.lower() == "yes"):
+            strong_signal = "✅"
 
         results.append({
             "Ticker": ticker,
-            "Price": round(stock['price'], 2),
-            "Volume": stock['volume'],
-            "Predicted Price": pred_price,
+            "Price": round(price, 2),
+            "Volume": volume,
+            "Predicted Price": round(pred_price, 2) if pred_price is not None else "N/A",
             "Sentiment": sentiment,
             "Buy Recommendation": buy,
-            "Stop Loss": stop_loss,
-            "Strong Signal": "✅" if isinstance(pred_price, float) and pred_price > stock['price'] and buy.lower() == "yes" else ""
+            "Stop Loss": stop_loss if stop_loss else "N/A",
+            "Strong Signal": strong_signal
         })
-
-        time.sleep(1)  # API rate-limit safe delay
+        time.sleep(0.8)  # Slight delay to avoid API rate limit
     return results
 
 def send_telegram_message(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     params = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
-    return requests.get(url, params=params).status_code == 200
+    try:
+        resp = requests.get(url, params=params)
+        return resp.status_code == 200
+    except:
+        return False
+
 
 # === Streamlit UI ===
-st.set_page_config(page_title="Stock Dashboard", layout="wide")
+st.set_page_config(page_title="📊 Sector-wise Stock Dashboard", layout="wide")
+
 st.title("📊 Sector-wise Stock Dashboard with LLM Predictions")
 
-# Auto-refresh checkbox & manual refresh button
-auto_refresh = st.sidebar.checkbox("⏱ Auto-Refresh (every 2 min)")
-if auto_refresh:
-    st_autorefresh(interval=120000, limit=None, key="auto_refresh")
+# Autorefresh every 5 minutes (300000 ms)
+st_autorefresh = st.experimental_memo.clear()  # Clear cache to force refresh if needed, or skip
+refresh_interval = 300  # seconds
+st_autorefresh_id = st.experimental_get_query_params().get("refresh", ["0"])[0]
 
-refresh = st.button("🔄 Refresh Sector Data")
-
-# Select sector
-sectors = list(ETF_SECTORS.keys()) + ["Penny Stocks"]
-sector = st.sidebar.selectbox("Select Sector", sectors)
-tickers = PENNY_STOCKS if sector == "Penny Stocks" else ETF_SECTORS[sector]
-
-# Cached process_sector to avoid re-calc per session unless refresh
-@st.cache_data(show_spinner=False)
-def cached_sector_data(tickers):
-    return process_sector(tickers)
-
-if refresh:
-    st.cache_data.clear()
+if st.button("Refresh Now 🔄"):
     st.experimental_rerun()
 
-with st.spinner(f"🔍 Loading {sector} data..."):
-    data = cached_sector_data(tickers)
+sectors = list(ETF_SECTORS.keys()) + ["Penny Stocks"]
+sector = st.sidebar.selectbox("Select Sector", sectors)
+
+tickers = PENNY_STOCKS if sector == "Penny Stocks" else ETF_SECTORS[sector]
+
+with st.spinner(f"Loading data for {sector}..."):
+    data = process_sector(tickers)
 
 if not data:
-    st.warning("No data found.")
+    st.warning("No data found for this sector.")
 else:
     df = pd.DataFrame(data)
 
-    # Style dataframe: highlight max volume, green buy, green background for strong signals
+    # Defensive check for columns
+    columns_to_display = ["Ticker", "Price", "Volume", "Predicted Price", "Sentiment", "Buy Recommendation", "Stop Loss", "Strong Signal"]
+
+    # Apply styling to dataframe
     def highlight_buy(val):
-        if str(val).lower() == "yes":
-            return "color: green; font-weight: bold"
-        return ""
+        if isinstance(val, str):
+            if val.lower() == "yes":
+                return 'color: green; font-weight: bold;'
+            elif val.lower() == "no":
+                return 'color: red; font-weight: bold;'
+        return ''
 
-    def highlight_signal(val):
+    def highlight_strong_signal(val):
         if val == "✅":
-            return "background-color: #d4edda; font-weight: bold"
-        return ""
-
-    def highlight_volume_max(s):
-        is_max = s == s.max()
-        return ["background-color: lightblue" if v else "" for v in is_max]
+            return 'background-color: #d4edda; font-weight: bold;'
+        return ''
 
     styled_df = (
         df.style
-        .apply(highlight_volume_max, subset=["Volume"])
-        .applymap(highlight_buy, subset=["Buy Recommendation"])
-        .applymap(highlight_signal, subset=["Strong Signal"])
-        .format({"Price": "${:.2f}", "Predicted Price": "${}", "Stop Loss": "${:.2f}"})
+        .applymap(highlight_buy, subset=['Buy Recommendation'])
+        .applymap(highlight_strong_signal, subset=['Strong Signal'])
+        .background_gradient(subset=['Volume'], cmap='Blues')
+        .format({"Price": "${:.2f}", "Predicted Price": "${}", "Stop Loss": "${}"})
     )
 
-    st.dataframe(styled_df, height=600)
+    st.dataframe(styled_df, use_container_width=True)
 
+    csv = df.to_csv(index=False).encode('utf-8')
     st.download_button(
-        "📥 Download CSV",
-        df.to_csv(index=False).encode('utf-8'),
-        f"{sector}_stocks.csv",
-        "text/csv"
+        label="📥 Download CSV",
+        data=csv,
+        file_name=f"{sector}_stocks.csv",
+        mime="text/csv"
     )
 
-    if st.button("🚀 Send to Telegram"):
+    if st.button("🚀 Send Overview to Telegram"):
         msg = f"*{sector} Sector Overview*\n\n"
         for row in data:
-            msg += (f"{row['Ticker']}: Price ${row['Price']}, Predicted ${row['Predicted Price']}, "
-                    f"Sentiment: {row['Sentiment']}, Buy: {row['Buy Recommendation']}, "
-                    f"SL: ${row['Stop Loss']}, Signal: {row['Strong Signal']}\n")
+            msg += (
+                f"{row['Ticker']}: Price ${row['Price']}, Predicted ${row['Predicted Price']}, "
+                f"Sentiment: {row['Sentiment']}, Buy: {row['Buy Recommendation']}, "
+                f"Stop Loss: ${row['Stop Loss']}, Signal: {row['Strong Signal']}\n"
+            )
         if send_telegram_message(msg):
             st.success("Sent to Telegram!")
         else:
             st.error("Failed to send message.")
+
+# Note: For full auto-refresh, consider using:
+#   `st.experimental_rerun()` with a timer or JavaScript injected,
+# or run with Streamlit’s native rerun feature on file change or manually press Refresh.
