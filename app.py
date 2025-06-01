@@ -104,4 +104,9 @@ if st.button("📤 Send Updates to Telegram"):
     try:
         message = df.to_markdown(index=False)
         requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_BOT
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            data={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
+        )
+        st.success("Notification sent successfully!")
+    except Exception as e:
+        st.error(f"Failed to send: {e}")
