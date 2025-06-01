@@ -2,16 +2,14 @@ import streamlit as st
 import yfinance as yf
 from huggingface_hub import InferenceClient
 import pandas as pd
-import time
 import requests
 import matplotlib.pyplot as plt
 
-# ===== Direct API tokens (replace with your tokens) =====
+# ===== API tokens (replace with your tokens) =====
 HF_API_TOKEN = "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"
 TELEGRAM_BOT_TOKEN = "7842285230:AAFcisrfFg40AqYjvrGaiq984DYeEu3p6hY"
 TELEGRAM_CHAT_ID = "7581145756"
 
-# Initialize Huggingface client
 client = InferenceClient(token=HF_API_TOKEN)
 
 ETF_SECTORS = {
@@ -39,6 +37,7 @@ MODELS = {
     "buy_recommendation": "fuchenru/Trading-Hero-LLM"
 }
 
+@st.cache_data(show_spinner=False)
 def fetch_stock_data(ticker):
     try:
         stock = yf.Ticker(ticker)
@@ -49,6 +48,7 @@ def fetch_stock_data(ticker):
     except Exception:
         return {"price": None, "volume": None}
 
+@st.cache_data(show_spinner=False)
 def call_hf_model_price(ticker):
     try:
         output = client.text_generation(model=MODELS["price_prediction"], inputs=ticker)
@@ -62,6 +62,7 @@ def call_hf_model_price(ticker):
     except Exception as e:
         return f"Error: {e}"
 
+@st.cache_data(show_spinner=False)
 def call_hf_model_sentiment(ticker):
     try:
         output = client.text_classification(model=MODELS["news_sentiment"], inputs=ticker)
@@ -71,6 +72,7 @@ def call_hf_model_sentiment(ticker):
     except Exception as e:
         return f"Error: {e}"
 
+@st.cache_data(show_spinner=False)
 def call_hf_model_buy(ticker):
     try:
         prompt = f"Should I buy {ticker} stock? Please answer in one word."
@@ -111,7 +113,6 @@ def process_sector(sector_name, tickers):
             "Stop Loss": stop_loss
         })
 
-        time.sleep(1)  # To avoid rate limiting
     return results
 
 def send_telegram_message(message):
@@ -139,7 +140,6 @@ if not data:
 else:
     df = pd.DataFrame(data)
 
-    # Format prices nicely
     def format_price(x):
         if isinstance(x, (float, int)):
             return f"${x:.2f}"
@@ -148,7 +148,6 @@ else:
     df['Price_display'] = df['Price'].apply(format_price)
     df['Stop Loss_display'] = df['Stop Loss'].apply(format_price)
 
-    # Strong Buy Signal if predicted price > price and Buy Recommendation contains "buy"
     def strong_buy(row):
         try:
             pred = float(row['Predicted Price'])
@@ -163,7 +162,6 @@ else:
 
     df['Strong Buy Signal'] = df.apply(strong_buy, axis=1)
 
-    # Highlight rows where predicted price > price
     def highlight_row(row):
         try:
             pred = float(row['Predicted Price'])
@@ -177,7 +175,6 @@ else:
     styled_df = df.style.apply(highlight_row, axis=1)
     st.dataframe(styled_df)
 
-    # Price vs Predicted Price chart for top 10 by volume
     top10 = df.sort_values('Volume', ascending=False).head(10)
     fig, ax = plt.subplots(figsize=(10, 5))
     ax.bar(top10['Ticker'], top10['Price'], label='Current Price', alpha=0.7)
@@ -187,7 +184,6 @@ else:
     ax.legend()
     st.pyplot(fig)
 
-    # Download CSV
     csv = df.to_csv(index=False).encode('utf-8')
     st.download_button(
         label="Download CSV",
@@ -196,7 +192,6 @@ else:
         mime='text/csv'
     )
 
-    # Telegram send button
     if st.button("📤 Send to Telegram"):
         message = f"*Sector:* {selected_sector}\n\n"
         for _, row in df.iterrows():
@@ -210,3 +205,4 @@ else:
             st.success("✅ Telegram message sent!")
         else:
             st.error("❌ Failed to send Telegram message.")
+
