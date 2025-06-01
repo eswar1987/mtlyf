@@ -20,7 +20,7 @@ MODELS = {
 
 # === Sector Data ===
 SECTORS = {
-   'Tech': ["AAPL", "GOOG", "MSFT", "TSLA", "AMD", "NVDA", "INTC", "CRM", "ADBE", "AVGO", "ORCL", "CSCO", "QCOM", "NOW", "UBER", "SNOW", "TWLO", "WORK", "MDB", "ZI"],
+    'Tech': ["AAPL", "GOOG", "MSFT", "TSLA", "AMD", "NVDA", "INTC", "CRM", "ADBE", "AVGO", "ORCL", "CSCO", "QCOM", "NOW", "UBER", "SNOW", "TWLO", "WORK", "MDB", "ZI"],
     'HealthCare': ["JNJ", "PFE", "MRK", "ABT", "GILD", "LLY", "BMY", "UNH", "AMGN", "CVS", "MDT", "ISRG", "ZTS", "REGN", "VRTX", "BIIB", "BAX", "HCA", "DGX", "IDXX"],
     'Financials': ["JPM", "BAC", "C", "WFC", "GS", "MS", "USB", "AXP", "PNC", "SCHW", "BK", "BLK", "TFC", "CME", "MMC", "SPGI", "ICE", "STT", "FRC", "MTB"],
     'ConsumerDiscretionary': ["AMZN", "TSLA", "HD", "MCD", "NKE", "SBUX", "LOW", "TJX", "GM", "F", "DG", "ROST", "CMG", "YUM", "DHI", "LEN", "BBY", "WHR", "LVS", "MAR"],
@@ -113,11 +113,17 @@ if data:
     def highlight_row(row):
         return ["background-color: #d1f0d1" if row["Strong Signal"] == "✅" else "" for _ in row]
 
+    def safe_format(val, fmt):
+        try:
+            return fmt.format(val)
+        except:
+            return val
+
     styled_df = df.style.apply(highlight_row, axis=1).format({
-        "Price": "${:,.2f}",
-        "Predicted Price": "${:,.2f}",
-        "Stop Loss": "${:,.2f}",
-        "Volume": "{:,}"
+        "Price": lambda x: safe_format(x, "${:,.2f}"),
+        "Predicted Price": lambda x: safe_format(x, "${:,.2f}"),
+        "Stop Loss": lambda x: safe_format(x, "${:,.2f}"),
+        "Volume": lambda x: safe_format(x, "{:,}")
     })
 
     st.dataframe(styled_df, height=600)
