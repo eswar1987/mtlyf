@@ -5,3 +5,4 @@ pandas
 requests
 huggingface-hub
 python-dotenv
+requests
