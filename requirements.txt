@@ -1,15 +1,8 @@
 streamlit
-
 yfinance
-
 huggingface_hub
-
 pandas
-
 matplotlib
-
 requests
-
 nest_asyncio
-
 python-dotenv
