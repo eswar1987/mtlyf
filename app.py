@@ -2,11 +2,16 @@ import streamlit as st
 import yfinance as yf
 from huggingface_hub import InferenceClient
 import pandas as pd
+import numpy as np
 import time
+import requests
 import re
 
-# === Secrets (move to env or secrets in production) ===
-HF_API_TOKEN = "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"
+# === Secrets ===
+HF_API_TOKEN = "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"  # Replace with your token or use secrets
+TELEGRAM_BOT_TOKEN = "7842285230:AAFcisrfFg40AqYjvrGaiq984DYeEu3p6hY"
+TELEGRAM_CHAT_ID = "7581145756"
+
 client = InferenceClient(token=HF_API_TOKEN)
 
 # === Models ===
@@ -16,6 +21,7 @@ MODELS = {
     "buy_recommendation": "fuchenru/Trading-Hero-LLM"
 }
 
+# === Sector Data ===
 ETF_SECTORS = {
     'Tech': ["AAPL", "GOOG", "MSFT", "TSLA", "AMD", "NVDA", "INTC", "CRM", "ADBE", "AVGO", "ORCL", "CSCO", "QCOM", "NOW", "UBER", "SNOW", "TWLO", "WORK", "MDB", "ZI"],
     'HealthCare': ["JNJ", "PFE", "MRK", "ABT", "GILD", "LLY", "BMY", "UNH", "AMGN", "CVS", "MDT", "ISRG", "ZTS", "REGN", "VRTX", "BIIB", "BAX", "HCA", "DGX", "IDXX"],
@@ -35,140 +41,170 @@ PENNY_STOCKS = [
     "CLOV", "AEMD", "ACHV", "BLNK", "CNET", "CERE", "FCEL", "IPHA", "KOSS", "MARA"
 ]
 
-# --- Helper functions ---
-
+# === Helper Functions ===
 def fetch_stock_data(ticker):
     try:
         stock = yf.Ticker(ticker)
         info = stock.info
         return {
             "price": info.get('regularMarketPrice') or info.get('previousClose'),
-            "volume": info.get('volume') or 0
+            "volume": info.get('volume')
         }
-    except:
+    except Exception as e:
         return {"price": None, "volume": None}
 
 def call_hf_model_price(ticker):
     try:
         output = client.text_generation(MODELS["price_prediction"], ticker)
-        # Extract first float number from the output
-        numbers = re.findall(r"\d+\.\d+", output.generated_text if hasattr(output, 'generated_text') else output)
-        return float(numbers[0]) if numbers else None
+        text = output.get("generated_text", "") if isinstance(output, dict) else output
+        numbers = re.findall(r"\d+\.\d+", text)
+        return float(numbers[0]) if numbers else "N/A"
     except:
-        return None
+        return "N/A"
 
 def call_hf_model_sentiment(ticker):
     try:
         output = client.text_classification(MODELS["news_sentiment"], ticker)
-        return output[0]["label"] if output else None
+        if output and isinstance(output, list) and "label" in output[0]:
+            return output[0]["label"]
+        return "N/A"
     except:
-        return None
+        return "N/A"
 
 def call_hf_model_buy(ticker):
     try:
         prompt = f"Should I buy {ticker} stock? One word answer."
         output = client.text_generation(MODELS["buy_recommendation"], prompt)
-        # Take first word from generated text
-        text = output.generated_text if hasattr(output, 'generated_text') else output
-        return text.strip().split()[0]
+        text = output.get("generated_text", "") if isinstance(output, dict) else output
+        return text.strip().split()[0].capitalize()
     except:
-        return None
+        return "N/A"
 
 def calc_stop_loss(price):
-    return round(price * 0.95, 2) if isinstance(price, (int, float)) else None
+    return round(price * 0.95, 2) if isinstance(price, (int, float, np.float64)) else "N/A"
 
-@st.cache_data(show_spinner=False)
 def process_sector(tickers):
     results = []
     for ticker in tickers:
         stock = fetch_stock_data(ticker)
-        price = stock['price']
-        if price is None:
+        if stock['price'] is None:
             continue
-        volume = stock['volume']
 
-        pred_price = call_hf_model_price(ticker) or 0
-        sentiment = call_hf_model_sentiment(ticker) or "N/A"
-        buy = call_hf_model_buy(ticker) or "No"
-        stop_loss = calc_stop_loss(price)
+        pred_price = call_hf_model_price(ticker)
+        sentiment = call_hf_model_sentiment(ticker)
+        buy = call_hf_model_buy(ticker)
+        stop_loss = calc_stop_loss(stock['price'])
 
-        strong_signal = "✅" if pred_price > price and buy.lower() == "yes" else ""
+        strong_signal = ""
+        try:
+            if (isinstance(pred_price, (int, float, np.float64)) and pred_price > stock['price'] 
+                and buy.lower() == "yes"):
+                strong_signal = "✅"
+        except:
+            strong_signal = ""
 
         results.append({
             "Ticker": ticker,
-            "Price": round(price, 2),
-            "Volume": volume,
-            "Predicted Price": round(pred_price, 2) if pred_price else "N/A",
+            "Price": stock['price'],
+            "Volume": stock['volume'] or 0,
+            "Predicted Price": pred_price,
             "Sentiment": sentiment,
             "Buy Recommendation": buy,
             "Stop Loss": stop_loss,
             "Strong Signal": strong_signal
         })
-        time.sleep(0.5)  # Reduce to avoid rate limits; adjust as needed
+
+        time.sleep(0.5)  # Small delay to avoid rate limits
     return results
 
-# === Streamlit UI ===
-st.set_page_config(page_title="📊 Sector Stock Dashboard with LLM Signals", layout="wide")
-st.title("📈 Sector-wise Stock Dashboard with LLM Predictions")
+def send_telegram_message(message):
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    params = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
+    try:
+        r = requests.get(url, params=params)
+        return r.status_code == 200
+    except:
+        return False
 
-sectors = list(ETF_SECTORS.keys()) + ["Penny Stocks"]
-sector = st.sidebar.selectbox("Select Sector", sectors)
+# === Formatting helpers ===
+def safe_money_format(x):
+    try:
+        return f"${float(x):,.2f}"
+    except:
+        return str(x)
 
-tickers = PENNY_STOCKS if sector == "Penny Stocks" else ETF_SECTORS[sector]
-
-# Button for manual refresh
-if st.sidebar.button("🔄 Refresh Data"):
-    st.cache_data.clear()
-
-with st.spinner(f"Fetching data for {sector}..."):
-    data = process_sector(tickers)
-
-if not data:
-    st.warning("No data found for this sector.")
-    st.stop()
-
-df = pd.DataFrame(data)
-
-# Summary stats
-avg_price = df["Price"].mean()
-total_volume = df["Volume"].sum()
-strong_buy_count = df["Strong Signal"].apply(lambda x: 1 if x == "✅" else 0).sum()
-
-col1, col2, col3 = st.columns(3)
-col1.metric("Average Price", f"${avg_price:,.2f}")
-col2.metric("Total Volume", f"{total_volume:,}")
-col3.metric("Strong Buy Signals", f"{strong_buy_count}")
-
-# Styling functions
 def highlight_volume_max(s):
     is_max = s == s.max()
     return ['background-color: lightblue' if v else '' for v in is_max]
 
 def color_buy(val):
-    if str(val).lower() == "yes":
+    if isinstance(val, str) and val.lower() == "yes":
         return 'color: green; font-weight: bold'
-    elif str(val).lower() == "no":
-        return 'color: red'
+    elif isinstance(val, str) and val.lower() == "no":
+        return 'color: red; font-weight: bold'
     return ''
 
 def highlight_strong_signal(val):
-    return 'background-color: #d4edda; font-weight: bold;' if val == "✅" else ''
+    if val == "✅":
+        return 'background-color: #d4edda; font-weight: bold; color: green'
+    return ''
 
-# Apply styling
-styled_df = df.style \
-    .apply(highlight_volume_max, subset=["Volume"]) \
-    .applymap(color_buy, subset=["Buy Recommendation"]) \
-    .applymap(highlight_strong_signal, subset=["Strong Signal"]) \
-    .format({"Price": "${:,.2f}", "Predicted Price": "${:,.2f}", "Stop Loss": "${:,.2f}", "Volume": "{:,}"})
+# === Streamlit UI ===
+st.set_page_config(page_title="Stock Dashboard with LLM Signals", layout="wide")
+st.title("📊 Sector-wise Stock Dashboard with LLM Predictions")
 
-# Display with st.write for stable Styler support
-st.write(styled_df, height=600)
+# Sidebar select
+sectors = list(ETF_SECTORS.keys()) + ["Penny Stocks"]
+sector = st.sidebar.selectbox("Select Sector", sectors)
 
-# CSV download
-csv = df.to_csv(index=False).encode('utf-8')
-st.download_button(
-    "📥 Download CSV",
-    csv,
-    f"{sector}_stocks.csv",
-    "text/csv"
-)
+tickers = PENNY_STOCKS if sector == "Penny Stocks" else ETF_SECTORS[sector]
+
+@st.cache_data(ttl=3600, show_spinner=False)  # Cache for 1 hour
+def cached_sector_data(tickers):
+    return process_sector(tickers)
+
+with st.spinner(f"Fetching data for {sector}... This may take a moment."):
+    data = cached_sector_data(tickers)
+
+if not data:
+    st.warning("No data found for the selected sector.")
+else:
+    df = pd.DataFrame(data)
+
+    # KPIs
+    avg_price = np.mean([x for x in df["Price"] if isinstance(x, (int, float, np.float64))])
+    total_vol = np.sum(df["Volume"])
+    strong_buy_count = df["Strong Signal"].apply(lambda x: x == "✅").sum()
+
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Average Price", f"${avg_price:,.2f}")
+    col2.metric("Total Volume", f"{total_vol:,}")
+    col3.metric("Strong Buy Signals", f"{strong_buy_count}")
+
+    # Styling
+    styled_df = df.style \
+        .apply(highlight_volume_max, subset=["Volume"]) \
+        .applymap(color_buy, subset=["Buy Recommendation"]) \
+        .applymap(highlight_strong_signal, subset=["Strong Signal"]) \
+        .format({
+            "Price": safe_money_format,
+            "Predicted Price": safe_money_format,
+            "Stop Loss": safe_money_format,
+            "Volume": "{:,}"
+        })
+
+    st.dataframe(styled_df, height=600)
+
+    csv = df.to_csv(index=False).encode('utf-8')
+    st.download_button("📥 Download CSV", csv, f"{sector}_stocks.csv", "text/csv")
+
+    if st.button("🚀 Send to Telegram"):
+        msg = f"*{sector} Sector Overview*\n\n"
+        for row in data:
+            msg += (f"{row['Ticker']}: Price ${row['Price']}, Predicted ${row['Predicted Price']}, "
+                    f"Sentiment: {row['Sentiment']}, Buy: {row['Buy Recommendation']}, "
+                    f"SL: ${row['Stop Loss']}, Signal: {row['Strong Signal']}\n")
+        if send_telegram_message(msg):
+            st.success("Telegram message sent!")
+        else:
+            st.error("Failed to send Telegram message.")
