@@ -1,23 +1,26 @@
-import nest_asyncio
-nest_asyncio.apply()
-
 import streamlit as st
 import yfinance as yf
 from huggingface_hub import InferenceClient
 import pandas as pd
 import time
 import requests
-import matplotlib.pyplot as plt
 import re
 
-# ===== Direct API tokens (replace with your tokens or load from env) =====
+# === Embed secrets directly ===
 HF_API_TOKEN = "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"
 TELEGRAM_BOT_TOKEN = "7842285230:AAFcisrfFg40AqYjvrGaiq984DYeEu3p6hY"
 TELEGRAM_CHAT_ID = "7581145756"
 
-# Initialize Huggingface client
 client = InferenceClient(token=HF_API_TOKEN)
 
+# === Models ===
+MODELS = {
+    "price_prediction": "SelvaprakashV/stock-prediction-model",
+    "news_sentiment": "cg1026/financial-news-sentiment-lora",
+    "buy_recommendation": "fuchenru/Trading-Hero-LLM"
+}
+
+# === Sector Data ===
 ETF_SECTORS = {
     'Tech': ["AAPL", "GOOG", "MSFT", "TSLA", "AMD", "NVDA", "INTC", "CRM", "ADBE", "AVGO", "ORCL", "CSCO", "QCOM", "NOW", "UBER", "SNOW", "TWLO", "WORK", "MDB", "ZI"],
     'HealthCare': ["JNJ", "PFE", "MRK", "ABT", "GILD", "LLY", "BMY", "UNH", "AMGN", "CVS", "MDT", "ISRG", "ZTS", "REGN", "VRTX", "BIIB", "BAX", "HCA", "DGX", "IDXX"],
@@ -37,172 +40,111 @@ PENNY_STOCKS = [
     "CLOV", "AEMD", "ACHV", "BLNK", "CNET", "CERE", "FCEL", "IPHA", "KOSS", "MARA"
 ]
 
-MODELS = {
-    "price_prediction": "SelvaprakashV/stock-prediction-model",
-    "news_sentiment": "cg1026/financial-news-sentiment-lora",
-    "buy_recommendation": "fuchenru/Trading-Hero-LLM"
-}
-
+# === Helper Functions ===
 def fetch_stock_data(ticker):
     try:
         stock = yf.Ticker(ticker)
         info = stock.info
-        price = info.get('regularMarketPrice') or info.get('previousClose')
-        volume = info.get('volume')
-        return {"price": price, "volume": volume}
-    except Exception:
+        return {
+            "price": info.get('regularMarketPrice') or info.get('previousClose'),
+            "volume": info.get('volume')
+        }
+    except:
         return {"price": None, "volume": None}
 
 def call_hf_model_price(ticker):
     try:
-        output = client.text_generation(model=MODELS["price_prediction"], data=ticker)
-        text = output[0]['generated_text'] if output else None
-        if text:
-            numbers = re.findall(r"\d+\.\d+", text)
-            if numbers:
-                return float(numbers[0])
-        return None
-    except Exception as e:
-        return f"Error: {e}"
+        output = client.text_generation(MODELS["price_prediction"], ticker)
+        numbers = re.findall(r"\d+\.\d+", output)
+        return float(numbers[0]) if numbers else "N/A"
+    except:
+        return "Error"
 
 def call_hf_model_sentiment(ticker):
     try:
-        output = client.text_classification(model=MODELS["news_sentiment"], data=ticker)
-        if output and isinstance(output, list):
-            return output[0].get("label", "N/A")
-        return "N/A"
-    except Exception as e:
-        return f"Error: {e}"
+        return client.text_classification(MODELS["news_sentiment"], ticker)[0]["label"]
+    except:
+        return "Error"
 
 def call_hf_model_buy(ticker):
     try:
-        prompt = f"Should I buy {ticker} stock? Please answer in one word."
-        output = client.text_generation(model=MODELS["buy_recommendation"], data=prompt)
-        if output:
-            text = output[0]['generated_text']
-            return text.strip().split()[0]
-        return "N/A"
-    except Exception as e:
-        return f"Error: {e}"
+        prompt = f"Should I buy {ticker} stock? One word answer."
+        output = client.text_generation(MODELS["buy_recommendation"], prompt)
+        return output.strip().split()[0]
+    except:
+        return "Error"
 
 def calc_stop_loss(price):
-    if price and isinstance(price, (float, int)):
-        return round(price * 0.95, 2)
-    return None
+    return round(price * 0.95, 2) if isinstance(price, (int, float)) else None
 
-def process_sector(sector_name, tickers):
+def process_sector(tickers):
     results = []
-    for t in tickers:
-        data = fetch_stock_data(t)
-        price = data['price']
-        volume = data['volume']
-        if price is None:
+    for ticker in tickers:
+        stock = fetch_stock_data(ticker)
+        if stock['price'] is None:
             continue
 
-        pred_price = call_hf_model_price(t)
-        sentiment = call_hf_model_sentiment(t)
-        buy_rec = call_hf_model_buy(t)
-        stop_loss = calc_stop_loss(price)
+        pred_price = call_hf_model_price(ticker)
+        sentiment = call_hf_model_sentiment(ticker)
+        buy = call_hf_model_buy(ticker)
+        stop_loss = calc_stop_loss(stock['price'])
 
         results.append({
-            "Ticker": t,
-            "Price": price,
-            "Volume": volume,
+            "Ticker": ticker,
+            "Price": round(stock['price'], 2),
+            "Volume": stock['volume'],
             "Predicted Price": pred_price,
             "Sentiment": sentiment,
-            "Buy Recommendation": buy_rec,
-            "Stop Loss": stop_loss
+            "Buy Recommendation": buy,
+            "Stop Loss": stop_loss,
+            "Strong Signal": "✅" if isinstance(pred_price, float) and pred_price > stock['price'] and buy.lower() == "yes" else ""
         })
 
-        time.sleep(1)  # To avoid rate limiting
+        time.sleep(1)
     return results
 
 def send_telegram_message(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     params = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
-    resp = requests.get(url, params=params)
-    return resp.status_code == 200
+    return requests.get(url, params=params).status_code == 200
 
-# ===== Streamlit UI =====
-st.title("Sector-wise Stock Dashboard with Predictions & Sentiments")
+# === Streamlit UI ===
+st.set_page_config(page_title="Stock Dashboard", layout="wide")
+st.title("📊 Sector-wise Stock Dashboard with LLM Predictions")
 
 sectors = list(ETF_SECTORS.keys()) + ["Penny Stocks"]
-selected_sector = st.sidebar.selectbox("Select Sector", sectors)
+sector = st.sidebar.selectbox("Select Sector", sectors)
 
-if selected_sector == "Penny Stocks":
-    tickers = PENNY_STOCKS
-else:
-    tickers = ETF_SECTORS[selected_sector]
+tickers = PENNY_STOCKS if sector == "Penny Stocks" else ETF_SECTORS[sector]
 
-with st.spinner(f"Fetching data for {selected_sector}..."):
-    data = process_sector(selected_sector, tickers)
+with st.spinner(f"Processing {sector}..."):
+    data = process_sector(tickers)
 
 if not data:
-    st.warning("No data available for this sector.")
+    st.warning("No data found.")
 else:
     df = pd.DataFrame(data)
 
-    def format_price(x):
-        if isinstance(x, (float, int)):
-            return f"${x:.2f}"
-        return x
+    st.dataframe(
+        df.style
+        .highlight_max(subset=["Volume"], color="lightblue")
+        .applymap(lambda v: "color: green;" if str(v).lower() == "yes" else "")
+        .applymap(lambda v: "background-color: #d4edda" if v == "✅" else "")
+    )
 
-    df['Price_display'] = df['Price'].apply(format_price)
-    df['Stop Loss_display'] = df['Stop Loss'].apply(format_price)
+    st.download_button(
+        "📥 Download CSV",
+        df.to_csv(index=False).encode('utf-8'),
+        f"{sector}_stocks.csv",
+        "text/csv"
+    )
 
-    def strong_buy(row):
-        try:
-            pred = float(row['Predicted Price'])
-            price = float(row['Price'])
-            rec = str(row['Buy Recommendation']).lower()
-            if pred > price and ("buy" in rec):
-                return "✅ Strong Buy"
-            else:
-                return ""
-        except Exception:
-            return ""
-
-    df['Strong Buy Signal'] = df.apply(strong_buy, axis=1)
-
-    def highlight_row(row):
-        try:
-            pred = float(row['Predicted Price'])
-            price = float(row['Price'])
-            if pred > price:
-                return ['background-color: #d4edda'] * len(row)
-        except:
-            pass
-        return [''] * len(row)
-
-    styled_df = df.style.apply(highlight_row, axis=1)
-    st.dataframe(styled_df)
-
-    top10 = df.sort_values('Volume', ascending=False).head(10)
-    fig, ax = plt.subplots(figsize=(10, 5))
-    ax.bar(top10['Ticker'], top10['Price'], label='Current Price', alpha=0.7)
-    ax.bar(top10['Ticker'], top10['Predicted Price'], label='Predicted Price', alpha=0.5)
-    ax.set_ylabel('Price ($)')
-    ax.set_title(f"Current vs Predicted Prices - Top 10 by Volume in {selected_sector}")
-    ax.legend()
-    st.pyplot(fig)
-
-    csv = df.to_csv(index=False)
-    st.download_button("Download data as CSV", csv, file_name=f"{selected_sector}_stocks.csv")
-
-    if st.button("Send Top 10 Strong Buy to Telegram"):
-        strong_buys = df[df['Strong Buy Signal'] == "✅ Strong Buy"]
-        top_strong_buys = strong_buys.sort_values('Volume', ascending=False).head(10)
-        if top_strong_buys.empty:
-            st.info("No strong buy signals to send.")
+    if st.button("🚀 Send to Telegram"):
+        msg = f"*{sector} Sector Overview*\n\n"
+        for row in data:
+            msg += f"{row['Ticker']}: Price ${row['Price']}, Predicted ${row['Predicted Price']}, Sentiment: {row['Sentiment']}, Buy: {row['Buy Recommendation']}, SL: ${row['Stop Loss']}, Signal: {row['Strong Signal']}\n"
+        if send_telegram_message(msg):
+            st.success("Sent!")
         else:
-            message = f"*Top 10 Strong Buy Signals for {selected_sector} Sector:*\n"
-            for _, row in top_strong_buys.iterrows():
-                message += f"\n*{row['Ticker']}*:\nPrice: ${row['Price']}\nPredicted Price: ${row['Predicted Price']}\nSentiment: {row['Sentiment']}\nBuy Rec: {row['Buy Recommendation']}\nStop Loss: ${row['Stop Loss']}\n"
-            success = send_telegram_message(message)
-            if success:
-                st.success("Message sent to Telegram!")
-            else:
-                st.error("Failed to send message.")
-
-
+            st.error("Failed to send.")
 
