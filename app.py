@@ -1,17 +1,21 @@
 import nest_asyncio
 nest_asyncio.apply()
+
 import streamlit as st
 import yfinance as yf
 from huggingface_hub import InferenceClient
 import pandas as pd
+import time
 import requests
 import matplotlib.pyplot as plt
+import re
 
-# ===== API tokens (replace with your tokens) =====
+# ===== Direct API tokens (replace with your tokens or load from env) =====
 HF_API_TOKEN = "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"
 TELEGRAM_BOT_TOKEN = "7842285230:AAFcisrfFg40AqYjvrGaiq984DYeEu3p6hY"
 TELEGRAM_CHAT_ID = "7581145756"
 
+# Initialize Huggingface client
 client = InferenceClient(token=HF_API_TOKEN)
 
 ETF_SECTORS = {
@@ -39,7 +43,6 @@ MODELS = {
     "buy_recommendation": "fuchenru/Trading-Hero-LLM"
 }
 
-@st.cache_data(show_spinner=False)
 def fetch_stock_data(ticker):
     try:
         stock = yf.Ticker(ticker)
@@ -50,13 +53,11 @@ def fetch_stock_data(ticker):
     except Exception:
         return {"price": None, "volume": None}
 
-@st.cache_data(show_spinner=False)
 def call_hf_model_price(ticker):
     try:
-        output = client.text_generation(model=MODELS["price_prediction"], inputs=ticker)
+        output = client.text_generation(model=MODELS["price_prediction"], data=ticker)
         text = output[0]['generated_text'] if output else None
         if text:
-            import re
             numbers = re.findall(r"\d+\.\d+", text)
             if numbers:
                 return float(numbers[0])
@@ -64,21 +65,19 @@ def call_hf_model_price(ticker):
     except Exception as e:
         return f"Error: {e}"
 
-@st.cache_data(show_spinner=False)
 def call_hf_model_sentiment(ticker):
     try:
-        output = client.text_classification(model=MODELS["news_sentiment"], inputs=ticker)
+        output = client.text_classification(model=MODELS["news_sentiment"], data=ticker)
         if output and isinstance(output, list):
             return output[0].get("label", "N/A")
         return "N/A"
     except Exception as e:
         return f"Error: {e}"
 
-@st.cache_data(show_spinner=False)
 def call_hf_model_buy(ticker):
     try:
         prompt = f"Should I buy {ticker} stock? Please answer in one word."
-        output = client.text_generation(model=MODELS["buy_recommendation"], inputs=prompt)
+        output = client.text_generation(model=MODELS["buy_recommendation"], data=prompt)
         if output:
             text = output[0]['generated_text']
             return text.strip().split()[0]
@@ -115,6 +114,7 @@ def process_sector(sector_name, tickers):
             "Stop Loss": stop_loss
         })
 
+        time.sleep(1)  # To avoid rate limiting
     return results
 
 def send_telegram_message(message):
@@ -186,25 +186,23 @@ else:
     ax.legend()
     st.pyplot(fig)
 
-    csv = df.to_csv(index=False).encode('utf-8')
-    st.download_button(
-        label="Download CSV",
-        data=csv,
-        file_name=f"{selected_sector}_stocks.csv",
-        mime='text/csv'
-    )
+    csv = df.to_csv(index=False)
+    st.download_button("Download data as CSV", csv, file_name=f"{selected_sector}_stocks.csv")
 
-    if st.button("📤 Send to Telegram"):
-        message = f"*Sector:* {selected_sector}\n\n"
-        for _, row in df.iterrows():
-            message += (
-                f"{row['Ticker']}: Price {row['Price_display']}, Predicted {row['Predicted Price']}, "
-                f"Sentiment {row['Sentiment']}, Buy Rec: {row['Buy Recommendation']}, "
-                f"Stop Loss: {row['Stop Loss_display']}, {row['Strong Buy Signal']}\n"
-            )
-        sent = send_telegram_message(message)
-        if sent:
-            st.success("✅ Telegram message sent!")
+    if st.button("Send Top 10 Strong Buy to Telegram"):
+        strong_buys = df[df['Strong Buy Signal'] == "✅ Strong Buy"]
+        top_strong_buys = strong_buys.sort_values('Volume', ascending=False).head(10)
+        if top_strong_buys.empty:
+            st.info("No strong buy signals to send.")
         else:
-            st.error("❌ Failed to send Telegram message.")
+            message = f"*Top 10 Strong Buy Signals for {selected_sector} Sector:*\n"
+            for _, row in top_strong_buys.iterrows():
+                message += f"\n*{row['Ticker']}*:\nPrice: ${row['Price']}\nPredicted Price: ${row['Predicted Price']}\nSentiment: {row['Sentiment']}\nBuy Rec: {row['Buy Recommendation']}\nStop Loss: ${row['Stop Loss']}\n"
+            success = send_telegram_message(message)
+            if success:
+                st.success("Message sent to Telegram!")
+            else:
+                st.error("Failed to send message.")
+
+
 
