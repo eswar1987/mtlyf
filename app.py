@@ -5,6 +5,7 @@ import pandas as pd
 import time
 import requests
 import re
+from streamlit_autorefresh import st_autorefresh
 
 # === Embed secrets directly ===
 HF_API_TOKEN = "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"
@@ -100,7 +101,7 @@ def process_sector(tickers):
             "Strong Signal": "✅" if isinstance(pred_price, float) and pred_price > stock['price'] and buy.lower() == "yes" else ""
         })
 
-        time.sleep(1)
+        time.sleep(1)  # API rate-limit safe delay
     return results
 
 def send_telegram_message(message):
@@ -112,25 +113,59 @@ def send_telegram_message(message):
 st.set_page_config(page_title="Stock Dashboard", layout="wide")
 st.title("📊 Sector-wise Stock Dashboard with LLM Predictions")
 
+# Auto-refresh checkbox & manual refresh button
+auto_refresh = st.sidebar.checkbox("⏱ Auto-Refresh (every 2 min)")
+if auto_refresh:
+    st_autorefresh(interval=120000, limit=None, key="auto_refresh")
+
+refresh = st.button("🔄 Refresh Sector Data")
+
+# Select sector
 sectors = list(ETF_SECTORS.keys()) + ["Penny Stocks"]
 sector = st.sidebar.selectbox("Select Sector", sectors)
-
 tickers = PENNY_STOCKS if sector == "Penny Stocks" else ETF_SECTORS[sector]
 
-with st.spinner(f"Processing {sector}..."):
-    data = process_sector(tickers)
+# Cached process_sector to avoid re-calc per session unless refresh
+@st.cache_data(show_spinner=False)
+def cached_sector_data(tickers):
+    return process_sector(tickers)
+
+if refresh:
+    st.cache_data.clear()
+    st.experimental_rerun()
+
+with st.spinner(f"🔍 Loading {sector} data..."):
+    data = cached_sector_data(tickers)
 
 if not data:
     st.warning("No data found.")
 else:
     df = pd.DataFrame(data)
 
-    st.dataframe(
+    # Style dataframe: highlight max volume, green buy, green background for strong signals
+    def highlight_buy(val):
+        if str(val).lower() == "yes":
+            return "color: green; font-weight: bold"
+        return ""
+
+    def highlight_signal(val):
+        if val == "✅":
+            return "background-color: #d4edda; font-weight: bold"
+        return ""
+
+    def highlight_volume_max(s):
+        is_max = s == s.max()
+        return ["background-color: lightblue" if v else "" for v in is_max]
+
+    styled_df = (
         df.style
-        .highlight_max(subset=["Volume"], color="lightblue")
-        .applymap(lambda v: "color: green;" if str(v).lower() == "yes" else "")
-        .applymap(lambda v: "background-color: #d4edda" if v == "✅" else "")
+        .apply(highlight_volume_max, subset=["Volume"])
+        .applymap(highlight_buy, subset=["Buy Recommendation"])
+        .applymap(highlight_signal, subset=["Strong Signal"])
+        .format({"Price": "${:.2f}", "Predicted Price": "${}", "Stop Loss": "${:.2f}"})
     )
+
+    st.dataframe(styled_df, height=600)
 
     st.download_button(
         "📥 Download CSV",
@@ -142,9 +177,10 @@ else:
     if st.button("🚀 Send to Telegram"):
         msg = f"*{sector} Sector Overview*\n\n"
         for row in data:
-            msg += f"{row['Ticker']}: Price ${row['Price']}, Predicted ${row['Predicted Price']}, Sentiment: {row['Sentiment']}, Buy: {row['Buy Recommendation']}, SL: ${row['Stop Loss']}, Signal: {row['Strong Signal']}\n"
+            msg += (f"{row['Ticker']}: Price ${row['Price']}, Predicted ${row['Predicted Price']}, "
+                    f"Sentiment: {row['Sentiment']}, Buy: {row['Buy Recommendation']}, "
+                    f"SL: ${row['Stop Loss']}, Signal: {row['Strong Signal']}\n")
         if send_telegram_message(msg):
-            st.success("Sent!")
+            st.success("Sent to Telegram!")
         else:
-            st.error("Failed to send.")
-
+            st.error("Failed to send message.")
