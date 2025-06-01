@@ -1,7 +1,7 @@
-streamlit
+streamlit-autorefresh
+matplotlib
 yfinance
-huggingface-hub
 pandas
 requests
+huggingface-hub
 python-dotenv
-streamlit-autorefresh
