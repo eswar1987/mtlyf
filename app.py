@@ -2,30 +2,22 @@ import streamlit as st
 import yfinance as yf
 from huggingface_hub import InferenceClient
 import pandas as pd
-import time
-import re
-import logging
-import requests
+import time, re, logging, requests
 from io import BytesIO
 
-# Setup logging
 logging.basicConfig(level=logging.INFO)
 
-# === Secrets / Tokens ===
+# === Secrets & Models ===
 HF_API_TOKEN = "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"
 TELEGRAM_BOT_TOKEN = "7842285230:AAFcisrfFg40AqYjvrGaiq984DYeEu3p6hY"
 TELEGRAM_CHAT_ID = "7581145756"
-
 client = InferenceClient(token=HF_API_TOKEN)
-
-# === Models ===
 MODELS = {
     "price_prediction": "SelvaprakashV/stock-prediction-model",
     "news_sentiment": "cg1026/financial-news-sentiment-lora",
     "buy_recommendation": "fuchenru/Trading-Hero-LLM"
 }
 
-# === Sector Data ===
 ETF_SECTORS = {
     'Tech': ["AAPL", "GOOG", "MSFT", "TSLA", "AMD", "NVDA", "INTC", "CRM", "ADBE", "AVGO", "ORCL", "CSCO", "QCOM", "NOW", "UBER", "SNOW", "TWLO", "WORK", "MDB", "ZI"],
     'HealthCare': ["JNJ", "PFE", "MRK", "ABT", "GILD", "LLY", "BMY", "UNH", "AMGN", "CVS", "MDT", "ISRG", "ZTS", "REGN", "VRTX", "BIIB", "BAX", "HCA", "DGX", "IDXX"],
@@ -41,180 +33,154 @@ ETF_SECTORS = {
 }
 
 # === Helper Functions ===
-
 def fetch_stock_data(ticker):
     try:
-        stock = yf.Ticker(ticker)
-        info = stock.info
-        price = info.get('regularMarketPrice') or info.get('previousClose')
-        volume = info.get('volume')
-        return {"price": price, "volume": volume}
-    except Exception as e:
-        logging.error(f"Fetch data error for {ticker}: {e}")
-        return {"price": None, "volume": None}
+        info = yf.Ticker(ticker).info
+        return {"price": info.get('regularMarketPrice') or info.get('previousClose'), "volume": info.get('volume')}
+    except: return {"price": None, "volume": None}
 
 def call_hf_model_price(ticker, retries=3):
     for _ in range(retries):
-        try:
-            output = client.text_generation(MODELS["price_prediction"], ticker)
-            text = output.get("generated_text", "") if isinstance(output, dict) else output
-            numbers = re.findall(r"\d+\.\d+", text)
-            if numbers:
-                price = float(numbers[0])
-                if price > 0:
-                    return price
-            time.sleep(1)
-        except Exception as e:
-            logging.error(f"Price prediction error for {ticker}: {e}")
+        o = client.text_generation(MODELS["price_prediction"], ticker)
+        text = o.get("generated_text", o) if isinstance(o, dict) else o
+        nums = re.findall(r"\d+\.\d+", text)
+        if nums and (price:=float(nums[0]))>0: return price
+        time.sleep(1)
     return None
 
 def call_hf_model_sentiment(ticker, retries=3):
     for _ in range(retries):
-        try:
-            output = client.text_classification(MODELS["news_sentiment"], ticker)
-            if output and isinstance(output, list) and "label" in output[0]:
-                return output[0]["label"]
-            time.sleep(1)
-        except Exception as e:
-            logging.error(f"Sentiment error for {ticker}: {e}")
+        o = client.text_classification(MODELS["news_sentiment"], ticker)
+        if isinstance(o, list) and "label" in o[0]:
+            return o[0]["label"]
+        time.sleep(1)
     return "Neutral"
 
 def call_hf_model_buy(ticker, retries=3):
-    prompt = f"Should I buy {ticker} stock? One word answer."
+    prompt=f"Should I buy {ticker} stock? One word answer."
     for _ in range(retries):
-        try:
-            output = client.text_generation(MODELS["buy_recommendation"], prompt)
-            text = output.get("generated_text", "") if isinstance(output, dict) else output
-            match = re.search(r"\b(yes|no|buy|hold|sell|strong buy|strong sell)\b", text, re.I)
-            if match:
-                answer = match.group(0).lower()
-                return "Yes" if answer in ["yes", "buy", "strong buy"] else "No"
-            time.sleep(1)
-        except Exception as e:
-            logging.error(f"Buy recommendation error for {ticker}: {e}")
+        o = client.text_generation(MODELS["buy_recommendation"], prompt)
+        text = o.get("generated_text", o) if isinstance(o, dict) else o
+        m = re.search(r"\b(yes|no|buy|hold|sell|strong buy|strong sell)\b", text, re.I)
+        if m:
+            return "Yes" if m.group(0).lower() in ["yes","buy","strong buy"] else "No"
+        time.sleep(1)
     return "No"
 
 def calc_stop_loss(price):
-    return round(price * 0.95, 2) if isinstance(price, (int, float)) else None
+    return round(price*0.95, 2) if isinstance(price, (int,float)) else None
 
-def is_strong_signal(pred_price, current_price, buy_recommendation):
-    try:
-        return (pred_price > current_price) and (buy_recommendation.lower() == "yes")
-    except:
-        return False
+def is_strong_signal(pred, current, buy):
+    return bool(pred and current and buy.lower()=="yes" and pred > current)
 
-@st.cache_data(show_spinner=False)
+@st.cache_data
 def process_sector(tickers):
-    results = []
-    for ticker in tickers:
-        stock = fetch_stock_data(ticker)
-        if not stock or stock['price'] is None:
-            continue
-        pred_price = call_hf_model_price(ticker)
-        sentiment = call_hf_model_sentiment(ticker)
-        buy = call_hf_model_buy(ticker)
-        stop_loss = calc_stop_loss(stock['price'])
-        strong_signal = "✅" if is_strong_signal(pred_price, stock['price'], buy) else ""
-        results.append({
-            "Ticker": ticker,
-            "Price": round(stock['price'], 2),
-            "Volume": stock['volume'] or 0,
-            "Predicted Price": round(pred_price, 2) if pred_price is not None else "N/A",
-            "Sentiment": sentiment,
-            "Buy Recommendation": buy,
-            "Stop Loss": stop_loss,
-            "Strong Signal": strong_signal
-        })
-        time.sleep(0.5)
-    return results
+    res=[]
+    for t in tickers:
+        s=fetch_stock_data(t)
+        if not s or s["price"] is None: continue
+        p=call_hf_model_price(t)
+        sent=call_hf_model_sentiment(t)
+        b=call_hf_model_buy(t)
+        sl=calc_stop_loss(s["price"])
+        sig="✅" if is_strong_signal(p,s["price"],b) else ""
+        res.append({"Ticker":t, "Price":round(s["price"],2), "Volume":s["volume"] or 0,
+                    "Predicted Price":round(p,2) if p else "N/A", "Sentiment":sent,
+                    "Buy Recommendation":b, "Stop Loss":sl, "Strong Signal":sig})
+        time.sleep(0.3)
+    return pd.DataFrame(res)
 
-def send_telegram_message(message):
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    params = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
+def send_telegram_message(msg):
+    url=f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    params={"chat_id":TELEGRAM_CHAT_ID, "text":msg, "parse_mode":"Markdown"}
     try:
-        response = requests.get(url, params=params)
-        return response.status_code == 200
-    except Exception as e:
-        logging.error(f"Telegram send error: {e}")
-        return False
+        resp=requests.get(url,params=params)
+        return resp.status_code==200
+    except: return False
+
+def process_all_sectors_top_volume(limit=20):
+    all_tickers = [t for lst in ETF_SECTORS.values() for t in lst]
+    df = process_sector(all_tickers)
+    return df.sort_values("Volume", ascending=False).head(limit)
+
+def send_top_volume_to_telegram(limit=20):
+    df = process_all_sectors_top_volume(limit)
+    if df.empty:
+        return send_telegram_message("⚠️ No data for top volume stocks.")
+    lines=[f"*🔥 Top {limit} High‑Volume Stocks (All Sectors)*"]
+    for _, r in df.iterrows():
+        lines.append(
+            f"• *{r['Ticker']}* – ${r['Price']:.2f} | Pred: {r['Predicted Price']} "
+            f"| Buy: {r['Buy Recommendation']} | Vol: {int(r['Volume']):,} {r['Strong Signal']}"
+        )
+    return send_telegram_message("\n".join(lines))
 
 # === Streamlit UI ===
 st.set_page_config(page_title="Stock Sector Dashboard", layout="wide")
 st.title("📊 Stock Dashboard with AI Signals")
 
-# Sidebar
-sector = st.sidebar.selectbox("Select Sector", options=list(ETF_SECTORS.keys()))
-volume_threshold = st.sidebar.slider("Minimum Volume (in Millions)", min_value=0, max_value=50, value=10, step=1) * 1_000_000
-st.sidebar.markdown("## Info")
-st.sidebar.write("Volume filter, model outputs, and export options available.")
+sector = st.sidebar.selectbox("Select Sector", list(ETF_SECTORS.keys()))
+vol_thresh = st.sidebar.slider("Minimum Volume (M)", 0, 50, 10)*1_000_000
+st.sidebar.markdown("Model-powered signals | Export data | Telegram")
 
-# Process sector
-with st.spinner(f"Fetching and processing {sector} data..."):
-    data = process_sector(ETF_SECTORS[sector])
-    df = pd.DataFrame(data)
-
-# Volume filter
-df = df[df["Volume"] > volume_threshold]
+df_sector = process_sector(ETF_SECTORS[sector])
+df = df_sector[df_sector["Volume"] > vol_thresh]
 
 if df.empty:
-    st.warning("No data available for selected filters.")
+    st.warning("No data for chosen filters.")
     st.stop()
 
-# Metrics
-buy_yes = df[df["Buy Recommendation"] == "Yes"].shape[0]
-buy_no = df[df["Buy Recommendation"] == "No"].shape[0]
-col1, col2 = st.columns(2)
-col1.metric("🟢 Buy Recommendations", buy_yes)
-col2.metric("🔴 Not Buy", buy_no)
+buy_yes, buy_no = df[df["Buy Recommendation"]=="Yes"].shape[0], df[df["Buy Recommendation"]=="No"].shape[0]
+c1, c2 = st.columns(2)
+c1.metric("🟢 Buy", buy_yes)
+c2.metric("🔴 Not Buy", buy_no)
 
-# Styling
-def highlight_volume(val):
-    return 'background-color: lightgreen' if val > 10_000_000 else (
-           'background-color: lightyellow' if val > 1_000_000 else 'background-color: lightcoral')
+def fmt_vol(v):
+    if v>10_000_000: return 'background-color: lightgreen'
+    if v>1_000_000: return 'background-color: lightyellow'
+    return 'background-color: lightcoral'
 
-def highlight_strong_signal(val):
-    return "background-color: #90ee90; font-weight: bold; color: green" if val == "✅" else ""
-
-def highlight_buy_rec(val):
-    return "color: green; font-weight: bold" if val == "Yes" else ("color: red; font-weight: bold" if val == "No" else "")
-
-styled_df = (
-    df.style
-    .applymap(highlight_buy_rec, subset=["Buy Recommendation"])
-    .applymap(highlight_strong_signal, subset=["Strong Signal"])
-    .applymap(highlight_volume, subset=["Volume"])
-    .format({
-        "Price": "${:,.2f}",
-        "Predicted Price": lambda x: f"${x:.2f}" if isinstance(x, (float,int)) else x,
-        "Stop Loss": lambda x: f"${x:.2f}" if isinstance(x, (float,int)) else x,
-        "Volume": "{:,}"
-    })
-    .set_properties(subset=["Ticker"], **{'font-weight': 'bold'})
+styled = (
+    df.style.applymap(lambda v: "color: green; font-weight: bold" if v=="Yes" else ("color: red; font-weight: bold" if v=="No" else ""),
+                     subset=["Buy Recommendation"])
+            .applymap(lambda v: "background-color: #90ee90; font-weight: bold; color: green" if v=="✅" else "", subset=["Strong Signal"])
+            .applymap(fmt_vol, subset=["Volume"])
+            .format({"Price":"${:,.2f}", "Predicted Price":lambda x: f"${x:.2f}" if isinstance(x,(int,float)) else x,
+                     "Stop Loss":lambda x: f"${x:.2f}" if isinstance(x,(int,float)) else x, "Volume":"{:,}"})
+            .set_properties(subset=["Ticker"], **{"font-weight":"bold"})
 )
 
-st.dataframe(styled_df, height=650)
+st.dataframe(styled, height=600)
 
-# Export options
-st.markdown("### 📥 Export Data")
-col_csv, col_excel = st.columns(2)
+# Exports
+st.markdown("### 📥 Export")
+csv_data = df.to_csv(index=False).encode()
+buf = BytesIO(); df.to_excel(buf, index=False, engine="openpyxl"); xlsx_data = buf.getvalue()
+c_csv, c_xl = st.columns(2)
+c_csv.download_button("⬇️ CSV", csv_data, "stocks.csv","text/csv")
+c_xl.download_button("⬇️ Excel", xlsx_data, "stocks.xlsx","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-csv_data = df.to_csv(index=False).encode('utf-8')
-excel_buffer = BytesIO()
-df.to_excel(excel_buffer, index=False, engine='openpyxl')
-excel_data = excel_buffer.getvalue()
+# Telegram Buttons
+if st.button("📤 Send Buy Summary to Telegram"):
+    msg=(
+        f"*Buy Recs in {sector} Sector*\n"
+        f"Yes: {buy_yes}  |  No: {buy_no}\n"
+        f"Filtered Volume > {vol_thresh:,}"
+    )
+    st.success("Sent!" if send_telegram_message(msg) else "Failed.")
 
-col_csv.download_button("⬇️ Download CSV", csv_data, "stocks.csv", "text/csv")
-col_excel.download_button("⬇️ Download Excel", excel_data, "stocks.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+if st.button("📤 Send Top 20 High‑Volume Stocks to Telegram"):
+    with st.spinner("Fetching top 20..."):
+        st.success("Sent!" if send_top_volume_to_telegram(20) else "Failed.")
 
-# Telegram Button
-if st.button("Send Buy Summary to Telegram"):
-    message = f"*Buy Recommendations in {sector} Sector:*\nYes: {buy_yes}\nNo: {buy_no}\nFiltered Volume > {volume_threshold:,}"
-    if send_telegram_message(message):
-        st.success("Telegram message sent!")
-    else:
-        st.error("Failed to send Telegram message.")
-
-# Future automation stub
+# Stub for future automation
 def automated_telegram_alert():
-    msg = f"📊 *Daily Stock Alert - {sector}*\nBuy: {buy_yes}\nNot Buy: {buy_no}\nFiltered by Volume > {volume_threshold:,}"
+    dft = process_all_sectors_top_volume(20)
+    msg = (
+        f"*Daily Top 20 High‑Volume Stocks*\n" +
+        "\n".join([
+            f"{r['Ticker']}: ${r['Price']:.2f}, Buy: {r['Buy Recommendation']}, Vol: {int(r['Volume']):,} {r['Strong Signal']}"
+            for _, r in dft.iterrows()
+        ])
+    )
     send_telegram_message(msg)
