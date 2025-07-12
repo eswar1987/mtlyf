@@ -7,3 +7,5 @@ huggingface-hub
 python-dotenv
 requests
 huggingface_hub
+transformers
+torch
