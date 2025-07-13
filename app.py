@@ -10,22 +10,20 @@ from transformers import AutoTokenizer, AutoModelForSequenceClassification
 import torch
 import torch.nn.functional as F
 
-# Setup logging
-logging.basicConfig(level=logging.INFO)
-
 # === Secrets / Tokens ===
 HF_API_TOKEN = "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"
 TELEGRAM_BOT_TOKEN = "7842285230:AAFcisrfFg40AqYjvrGaiq984DYeEu3p6hY"
 TELEGRAM_CHAT_ID = "7581145756"
-
 client = InferenceClient(token=HF_API_TOKEN)
 
 # === Models ===
 MODELS = {
     "price_prediction": "SelvaprakashV/stock-prediction-model",
-    "news_sentiment": "cg1026/financial-news-sentiment-lora",  # not used anymore
     "buy_recommendation": "fuchenru/Trading-Hero-LLM"
 }
+
+# === Logging ===
+logging.basicConfig(level=logging.INFO)
 
 # === Load FinBERT Sentiment Model ===
 @st.cache_resource
@@ -37,35 +35,50 @@ def load_sentiment_model():
 
 tokenizer, sentiment_model = load_sentiment_model()
 
-# === Sector Data ===
+# === Sectors ===
 ETF_SECTORS = {
-    'Tech': ["AAPL", "GOOG", "MSFT", "TSLA", "AMD", "NVDA", "INTC", "CRM", "ADBE", "AVGO", "ORCL", "CSCO", "QCOM", "NOW", "UBER", "SNOW", "TWLO", "WORK", "MDB", "ZI"],
-    'HealthCare': ["JNJ", "PFE", "MRK", "ABT", "GILD", "LLY", "BMY", "UNH", "AMGN", "CVS", "MDT", "ISRG", "ZTS", "REGN", "VRTX", "BIIB", "BAX", "HCA", "DGX", "IDXX"],
-    'Financials': ["JPM", "BAC", "C", "WFC", "GS", "MS", "USB", "AXP", "PNC", "SCHW", "BK", "BLK", "TFC", "CME", "MMC", "SPGI", "ICE", "STT", "FRC", "MTB"],
-    'ConsumerDiscretionary': ["AMZN", "TSLA", "HD", "MCD", "NKE", "SBUX", "LOW", "TJX", "GM", "F", "DG", "ROST", "CMG", "YUM", "DHI", "LEN", "BBY", "WHR", "LVS", "MAR"],
-    'Industrials': ["GE", "UPS", "CAT", "BA", "LMT", "MMM", "DE", "HON", "RTX", "GD", "EMR", "PNR", "ROK", "ETN", "CSX", "FDX", "CP", "XYL", "ITW", "DOV"],
-    'Energy': ["XOM", "CVX", "OXY", "SLB", "PXD", "EOG", "MPC", "VLO", "PSX", "COP", "HAL", "FTI", "BKR", "DVN", "CHK", "APA", "CXO", "MRO", "HES", "NBL"],
-    'Utilities': ["DUK", "SO", "NEE", "SRE", "EXC", "AEP", "XEL", "D", "ED", "PEG", "ES", "PPL", "WEC", "CMS", "EIX", "PNW", "FE", "ATO", "AES", "NRG"],
-    'BasicMaterials': ["LIN", "SHW", "ECL", "APD", "FCX", "NEM", "DD", "DOW", "CE", "PPG", "VMC", "LYB", "IP", "BLL", "MLM", "NUE", "PKG", "AVY", "PKX"],
-    'ETFs': ["SPY", "QQQ", "DIA", "IWM", "ARKK", "ARKW", "SMH", "IYT", "XLF", "XLE", "XLK", "XLY", "XLV", "XLI", "XLB", "XLU", "XLRE", "XLC", "VOO"],
-    'LeveragedETFs': ["TQQQ", "SQQQ", "SPXL", "SPXS", "UPRO", "SDOW", "SOXL", "SOXS", "LABU", "LABD", "FAS", "FAZ", "TNA", "TZA", "DRN", "DRV", "TECL", "TECS", "DFEN", "DUST"],
-    'Commodities': ["GC=F", "SI=F", "CL=F"]
+    'Tech': ["AAPL", "GOOG", "MSFT", "TSLA", "AMD", "NVDA", "INTC"],
+    'HealthCare': ["JNJ", "PFE", "MRK", "ABT"],
+    'Financials': ["JPM", "BAC", "C", "WFC"],
+    'ConsumerDiscretionary': ["AMZN", "MCD", "NKE"],
+    'Energy': ["XOM", "CVX", "SLB"]
 }
 
-PENNY_STOCKS = ["SENS", "SNDL", "GEVO", "FIZZ", "PLUG", "KNDI", "NIO", "NOK", "VSTM", "OCGN", "CLOV", "AEMD", "ACHV", "BLNK", "CNET", "CERE", "FCEL", "IPHA", "KOSS", "MARA"]
-
 # === Helper Functions ===
-
 def fetch_stock_data(ticker):
     try:
         stock = yf.Ticker(ticker)
         info = stock.info
-        price = info.get('regularMarketPrice') or info.get('previousClose')
-        volume = info.get('volume')
-        return {"price": price, "volume": volume}
+        return {
+            "price": info.get('regularMarketPrice') or info.get('previousClose'),
+            "volume": info.get('volume')
+        }
     except Exception as e:
-        logging.error(f"Fetch data error for {ticker}: {e}")
+        logging.error(f"Error fetching stock data for {ticker}: {e}")
         return {"price": None, "volume": None}
+
+def fetch_recent_headline(ticker):
+    try:
+        stock = yf.Ticker(ticker)
+        news = stock.news
+        if news and len(news) > 0:
+            return news[0]['title']
+    except Exception as e:
+        logging.warning(f"No news for {ticker}: {e}")
+    return f"{ticker} stock"  # fallback
+
+def call_local_sentiment_with_score(text):
+    try:
+        inputs = tokenizer(text, return_tensors="pt", truncation=True, padding=True)
+        with torch.no_grad():
+            outputs = sentiment_model(**inputs)
+            probs = F.softmax(outputs.logits, dim=1)
+            score, label_id = torch.max(probs, dim=1)
+            label = ["Negative", "Neutral", "Positive"][label_id.item()]
+            return label, round(score.item(), 2)
+    except Exception as e:
+        logging.error(f"Sentiment model error: {e}")
+        return "Neutral", 0.0
 
 def call_hf_model_price(ticker, retries=3):
     for _ in range(retries):
@@ -79,19 +92,6 @@ def call_hf_model_price(ticker, retries=3):
         except Exception as e:
             logging.error(f"Price prediction error for {ticker}: {e}")
     return None
-
-def call_local_sentiment(text):
-    try:
-        inputs = tokenizer(text, return_tensors="pt", truncation=True, padding=True)
-        with torch.no_grad():
-            outputs = sentiment_model(**inputs)
-            probs = F.softmax(outputs.logits, dim=1)
-            label_ids = torch.argmax(probs, dim=1).item()
-            labels = ["negative", "neutral", "positive"]
-            return labels[label_ids].capitalize()
-    except Exception as e:
-        logging.error(f"Local sentiment analysis error: {e}")
-        return "Neutral"
 
 def call_hf_model_buy(ticker, retries=3):
     prompt = f"Should I buy {ticker} stock? One word answer."
@@ -108,13 +108,10 @@ def call_hf_model_buy(ticker, retries=3):
     return "No"
 
 def calc_stop_loss(price):
-    return round(price * 0.95, 2) if isinstance(price, (int, float)) else None
+    return round(price * 0.95, 2) if price else None
 
 def is_strong_signal(pred_price, current_price, buy_recommendation):
-    try:
-        return (pred_price > current_price) and (buy_recommendation.lower() == "yes")
-    except:
-        return False
+    return pred_price and current_price and pred_price > current_price and buy_recommendation.lower() == "yes"
 
 def process_sector(tickers):
     results = []
@@ -122,9 +119,9 @@ def process_sector(tickers):
         stock = fetch_stock_data(ticker)
         if not stock or stock['price'] is None:
             continue
-
+        headline = fetch_recent_headline(ticker)
+        sentiment, confidence = call_local_sentiment_with_score(headline)
         pred_price = call_hf_model_price(ticker)
-        sentiment = call_local_sentiment(ticker)  # 🔄 Replaced HF with local PyTorch model
         buy = call_hf_model_buy(ticker)
         stop_loss = calc_stop_loss(stock['price'])
         strong_signal = "✅" if is_strong_signal(pred_price, stock['price'], buy) else ""
@@ -133,15 +130,16 @@ def process_sector(tickers):
             "Ticker": ticker,
             "Price": round(stock['price'], 2),
             "Volume": stock['volume'] or 0,
-            "Predicted Price": round(pred_price, 2) if pred_price is not None else "N/A",
+            "Predicted Price": round(pred_price, 2) if pred_price else "N/A",
+            "Headline": headline,
             "Sentiment": sentiment,
+            "Confidence": confidence,
             "Buy Recommendation": buy,
             "Stop Loss": stop_loss,
             "Strong Signal": strong_signal
         })
 
         time.sleep(0.5)
-
     return results
 
 def send_telegram_message(message):
@@ -155,87 +153,58 @@ def send_telegram_message(message):
         return False
 
 # === Streamlit UI ===
+st.set_page_config(page_title="📊 AI Stock Sentiment Dashboard", layout="wide")
+st.title("📊 AI Stock Sentiment Dashboard")
 
-st.set_page_config(page_title="Stock Sector Dashboard", layout="wide")
+sector = st.sidebar.selectbox("Select Sector", options=list(ETF_SECTORS.keys()))
+st.sidebar.markdown("Data powered by PyTorch FinBERT + HuggingFace + Yahoo Finance")
 
-st.title("📊 Stock Dashboard with AI Signals")
+with st.spinner(f"Processing data for {sector} sector..."):
+    tickers = ETF_SECTORS[sector]
+    data = process_sector(tickers)
+    df = pd.DataFrame(data)
 
-sector = st.sidebar.selectbox("Select Sector", options=list(ETF_SECTORS.keys()) + ["Top 20 by Volume (All Sectors)"])
-st.sidebar.markdown("## Info")
-st.sidebar.write("Data refreshed with HuggingFace + Local PyTorch FinBERT.")
+if df.empty:
+    st.warning("No data available for this sector.")
+    st.stop()
 
-if sector == "Top 20 by Volume (All Sectors)":
-    all_tickers = sum(ETF_SECTORS.values(), [])
-    with st.spinner("Fetching and processing all sectors for top 20 volume stocks..."):
-        all_data = process_sector(all_tickers)
-        df_all = pd.DataFrame(all_data)
-        if df_all.empty:
-            st.warning("No data available.")
-            st.stop()
-        df_top20 = df_all.sort_values(by="Volume", ascending=False).head(20)
-        df_display = df_top20.copy()
-        st.subheader("Top 20 Stocks by Volume Across All Sectors")
-else:
-    with st.spinner(f"Fetching and processing {sector} data..."):
-        data = process_sector(ETF_SECTORS[sector])
-        df_display = pd.DataFrame(data)
-        if df_display.empty:
-            st.warning("No data available for selected sector.")
-            st.stop()
-
-buy_yes = df_display[df_display["Buy Recommendation"] == "Yes"].shape[0]
-buy_no = df_display[df_display["Buy Recommendation"] == "No"].shape[0]
-
+# Metrics
+buy_yes = df[df["Buy Recommendation"] == "Yes"].shape[0]
+buy_no = df[df["Buy Recommendation"] == "No"].shape[0]
 col1, col2 = st.columns(2)
 col1.metric("🟢 Buy Recommendations", buy_yes)
 col2.metric("🔴 Not Buy", buy_no)
 
+# Styling
+def highlight_buy(val):
+    return "color: green; font-weight: bold" if val == "Yes" else "color: red; font-weight: bold"
+
+def highlight_signal(val):
+    return "background-color: #c8f7c5; font-weight: bold" if val == "✅" else ""
+
 def highlight_volume(val):
     if val > 10_000_000:
-        return 'background-color: lightgreen'
+        return "background-color: lightgreen"
     elif val > 1_000_000:
-        return 'background-color: lightyellow'
-    else:
-        return 'background-color: lightcoral'
-
-def highlight_strong_signal(val):
-    return "background-color: #90ee90; font-weight: bold; color: green" if val == "✅" else ""
-
-def highlight_buy_rec(val):
-    if val == "Yes":
-        return "color: green; font-weight: bold"
-    elif val == "No":
-        return "color: red; font-weight: bold"
-    return ""
+        return "background-color: lightyellow"
+    return "background-color: lightcoral"
 
 styled_df = (
-    df_display.style
-    .applymap(highlight_buy_rec, subset=["Buy Recommendation"])
-    .applymap(highlight_strong_signal, subset=["Strong Signal"])
+    df.style
+    .applymap(highlight_buy, subset=["Buy Recommendation"])
+    .applymap(highlight_signal, subset=["Strong Signal"])
     .applymap(highlight_volume, subset=["Volume"])
     .format({
         "Price": "${:,.2f}",
-        "Predicted Price": lambda x: f"${x:.2f}" if isinstance(x, (float,int)) else x,
-        "Stop Loss": lambda x: f"${x:.2f}" if isinstance(x, (float,int)) else x,
-        "Volume": "{:,}"
+        "Predicted Price": lambda x: f"${x:.2f}" if isinstance(x, (float, int)) else x,
+        "Stop Loss": lambda x: f"${x:.2f}" if isinstance(x, (float, int)) else x,
+        "Volume": "{:,}",
+        "Confidence": "{:.2f}"
     })
-    .set_properties(subset=["Ticker"], **{'font-weight': 'bold'})
 )
 
-st.dataframe(styled_df, height=650)
+st.dataframe(styled_df, height=700)
 
 if st.button("Send Buy Summary to Telegram"):
-    message = f"*Buy Recommendations in {sector} Sector:*\nYes: {buy_yes}\nNo: {buy_no}"
-    st.success("Telegram message sent!") if send_telegram_message(message) else st.error("Failed to send Telegram message.")
-
-if sector == "Top 20 by Volume (All Sectors)":
-    if st.button("Send Top 20 Stocks by Volume to Telegram"):
-        message_lines = [f"*Top 20 Stocks by Volume:*"]
-        for _, row in df_top20.iterrows():
-            line = (f"{row['Ticker']}: Price ${row['Price']}, "
-                    f"Volume {row['Volume']:,}, "
-                    f"Buy: {row['Buy Recommendation']}, "
-                    f"Signal: {row['Strong Signal']}")
-            message_lines.append(line)
-        message = "\n".join(message_lines)
-        st.success("Top 20 stocks message sent!") if send_telegram_message(message) else st.error("Failed to send.")
+    message = f"*Buy Summary for {sector} Sector:*\nYes: {buy_yes}\nNo: {buy_no}"
+    st.success("Message sent!") if send_telegram_message(message) else st.error("Failed to send message.")
