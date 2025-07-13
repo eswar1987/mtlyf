@@ -9,6 +9,8 @@ import requests
 from transformers import AutoTokenizer, AutoModelForSequenceClassification, pipeline
 import torch
 import torch.nn.functional as F
+from sklearn.linear_model import LinearRegression
+import numpy as np
 
 # === Secrets / Tokens ===
 HF_API_TOKEN = "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"
@@ -18,7 +20,7 @@ client = InferenceClient(token=HF_API_TOKEN)
 
 # === Models ===
 MODELS = {
-    "price_prediction": "SelvaprakashV/stock-prediction-model",
+    # Removed problematic price_prediction model
     "buy_recommendation": "fuchenru/Trading-Hero-LLM"
 }
 
@@ -88,25 +90,10 @@ def call_local_sentiment_with_score(text):
         logging.error(f"Sentiment model error: {e}")
         return "Neutral", 0.0
 
-def call_hf_model_price(ticker, retries=3):
-    for _ in range(retries):
-        try:
-            prompt = f"What is the projected price of {ticker} stock?"
-            output = client.text_generation(prompt=prompt, model=MODELS["price_prediction"])
-            text = output.get("generated_text", "") if isinstance(output, dict) else output
-            numbers = re.findall(r"\d+\.\d+", text)
-            if numbers:
-                return float(numbers[0])
-            time.sleep(1)
-        except Exception as e:
-            logging.error(f"Price prediction error for {ticker}: {e}")
-    return None
-
 def call_hf_model_buy(ticker):
     prompt = f"Should I buy {ticker} stock? One word answer."
     try:
         results = buy_rec_pipeline(prompt)
-        # The output format is a list of dicts, e.g. [{'label': 'BUY', 'score': 0.9}]
         if results and len(results) > 0:
             label = results[0]['label'].lower()
             if label in ['buy', 'yes', 'strong buy']:
@@ -123,6 +110,26 @@ def calc_stop_loss(price):
 def is_strong_signal(pred_price, current_price, buy_recommendation):
     return pred_price and current_price and pred_price > current_price and buy_recommendation.lower() == "yes"
 
+def predict_price_lr(ticker):
+    """
+    Predict next day closing price with simple linear regression on last 30 days closing prices.
+    """
+    try:
+        data = yf.Ticker(ticker).history(period="30d")
+        if data.empty or len(data) < 10:
+            return None
+        prices = data['Close'].values.reshape(-1, 1)
+        days = np.arange(len(prices)).reshape(-1, 1)
+
+        model = LinearRegression()
+        model.fit(days, prices)
+        next_day = np.array([[len(prices)]])
+        pred_price = model.predict(next_day)[0][0]
+        return round(float(pred_price), 2)
+    except Exception as e:
+        logging.error(f"Local price prediction error for {ticker}: {e}")
+        return None
+
 def process_sector(tickers):
     results = []
     for ticker in tickers:
@@ -131,7 +138,7 @@ def process_sector(tickers):
             continue
         headline = fetch_recent_headline(ticker)
         sentiment, confidence = call_local_sentiment_with_score(headline)
-        pred_price = call_hf_model_price(ticker)
+        pred_price = predict_price_lr(ticker)  # Use local LR price prediction
         buy = call_hf_model_buy(ticker)
         stop_loss = calc_stop_loss(stock['price'])
         strong_signal = "✅" if is_strong_signal(pred_price, stock['price'], buy) else ""
@@ -140,7 +147,7 @@ def process_sector(tickers):
             "Ticker": ticker,
             "Price": round(stock['price'], 2),
             "Volume": int(stock['volume']) if stock['volume'] else 0,
-            "Predicted Price": round(pred_price, 2) if pred_price else "N/A",
+            "Predicted Price": pred_price if pred_price else "N/A",
             "Headline": headline,
             "Sentiment": sentiment,
             "Confidence": confidence,
