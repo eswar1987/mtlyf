@@ -89,25 +89,16 @@ def call_local_sentiment_with_score(text):
         logging.error(f"Sentiment model error: {e}")
         return "Neutral", 0.0
 
-def call_hf_model_buy(ticker):
-    prompt = f"Should I buy {ticker} stock? One word answer."
-    try:
-        results = buy_rec_pipeline(prompt)
-        if results and len(results) > 0:
-            label = results[0]['label'].lower()
-            if label in ['buy', 'yes', 'strong buy']:
-                return "Yes"
-            else:
-                return "No"
-    except Exception as e:
-        logging.error(f"Buy recommendation error for {ticker}: {e}")
-    return "No"
-
 def calc_stop_loss(price):
     return round(price * 0.95, 2) if price else None
 
-def is_strong_signal(pred_price, current_price, buy_recommendation):
-    return pred_price and current_price and pred_price > current_price and buy_recommendation.lower() == "yes"
+def is_strong_signal(pred_price, current_price, confidence, volume):
+    return (
+        pred_price and current_price and
+        pred_price > current_price and
+        confidence >= 0.6 and
+        volume > 1_000_000
+    )
 
 # === LSTM Model Definition ===
 class StockPriceLSTM(nn.Module):
@@ -136,6 +127,43 @@ def prepare_data(df, sequence_length=20):
     X, y = np.array(X), np.array(y)
     return X, y, scaler
 
+def predict_price_lstm(ticker):
+    try:
+        df = yf.Ticker(ticker).history(period="100d")
+        if df.empty or len(df) < 30:
+            return None
+
+        X, y, scaler = prepare_data(df)
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+        model = StockPriceLSTM()
+        model.to(device)
+        criterion = nn.MSELoss()
+        optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+
+        X_tensor = torch.tensor(X, dtype=torch.float32).to(device)
+        y_tensor = torch.tensor(y, dtype=torch.float32).to(device)
+
+        model.train()
+        for epoch in range(50):
+            optimizer.zero_grad()
+            outputs = model(X_tensor)
+            loss = criterion(outputs, y_tensor)
+            loss.backward()
+            optimizer.step()
+
+        model.eval()
+        last_seq = torch.tensor(X[-1:], dtype=torch.float32).to(device)
+        with torch.no_grad():
+            pred_scaled = model(last_seq).cpu().numpy()
+
+        pred_price = scaler.inverse_transform(pred_scaled)[0][0]
+        return round(float(pred_price), 2)
+
+    except Exception as e:
+        logging.error(f"LSTM price prediction error for {ticker}: {e}")
+        return None
+
 def process_sector(tickers):
     results = []
     for ticker in tickers:
@@ -144,16 +172,16 @@ def process_sector(tickers):
             continue
         headline = fetch_recent_headline(ticker)
         sentiment, confidence = call_local_sentiment_with_score(headline)
-        pred_price = stock['price'] * 1.01  # placeholder for predicted price
-        buy = call_hf_model_buy(ticker)
+        pred_price = predict_price_lstm(ticker)
         stop_loss = calc_stop_loss(stock['price'])
-        strong_signal = "✅" if is_strong_signal(pred_price, stock['price'], buy) else ""
+        strong_signal = "✅" if is_strong_signal(pred_price, stock['price'], confidence, stock['volume']) else ""
+        buy = "Yes" if strong_signal else "No"
 
         results.append({
             "Ticker": ticker,
             "Price": round(stock['price'], 2),
             "Volume": int(stock['volume']) if stock['volume'] else 0,
-            "Predicted Price": round(pred_price, 2),
+            "Predicted Price": pred_price if pred_price else "N/A",
             "Headline": headline,
             "Sentiment": sentiment,
             "Confidence": confidence,
@@ -161,62 +189,18 @@ def process_sector(tickers):
             "Stop Loss": stop_loss,
             "Strong Signal": strong_signal
         })
-
         time.sleep(0.5)
     return results
 
-def backtest_yesterday_lstm_signal(ticker, window=20, days=60):
-    df = yf.Ticker(ticker).history(period=f"{days+window}d")
-    df = df.reset_index()
-    if df.empty or len(df) < window + 2:
-        return None, "Not enough historical data."
-
-    returns = []
-    signals = []
-
-    for i in range(window, len(df)-1):
-        prev_data = df.loc[i-window:i-1]
-        if prev_data['Close'].isnull().any():
-            continue
-
-        try:
-            X, _, scaler = prepare_data(prev_data)
-            model = StockPriceLSTM()
-            model.eval()
-            input_seq = torch.tensor(X[-1:]).float()
-            with torch.no_grad():
-                pred_scaled = model(input_seq).numpy()
-            pred_price = scaler.inverse_transform(pred_scaled)[0][0]
-        except Exception as e:
-            continue
-
-        yesterday_close = df.loc[i-1, 'Close']
-        today_open = df.loc[i, 'Open']
-        today_close = df.loc[i, 'Close']
-
-        buy_signal = pred_price > yesterday_close
-        signals.append((df.loc[i, 'Date'], pred_price, yesterday_close, buy_signal))
-
-        if buy_signal:
-            ret = (today_close - today_open) / today_open
-            returns.append(ret)
-        else:
-            returns.append(0)
-
-    returns = np.array(returns)
-    if len(returns) == 0:
-        return None, "No trades were made."
-
-    result = {
-        "Total Return (%)": round((np.prod(1 + returns) - 1) * 100, 2),
-        "Win Rate (%)": round(np.sum(returns > 0) / len(returns) * 100, 2),
-        "Avg Daily Return (%)": round(np.mean(returns) * 100, 2),
-        "Max Drawdown (%)": round(
-            np.min((np.cumprod(1 + returns) - np.maximum.accumulate(np.cumprod(1 + returns))) /
-                   np.maximum.accumulate(np.cumprod(1 + returns))) * 100, 2
-        )
-    }
-    return result, signals
+def send_telegram_message(message):
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    params = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
+    try:
+        response = requests.get(url, params=params)
+        return response.status_code == 200
+    except Exception as e:
+        logging.error(f"Telegram send error: {e}")
+        return False
 
 # === Streamlit UI ===
 st.set_page_config(page_title="📊 AI Stock Sentiment Dashboard", layout="wide")
@@ -269,20 +253,21 @@ styled_df = (
 
 st.dataframe(styled_df, height=700)
 
-st.subheader("📉 Backtest LSTM Buy Strategy")
-backtest_ticker = st.selectbox("Select Ticker to Backtest", ETF_SECTORS[sector], key="backtest")
+if st.button("Send Buy Summary to Telegram"):
+    message = f"*Buy Summary for {sector} Sector:*\nYes: {buy_yes}\nNo: {buy_no}"
+    st.success("Message sent!") if send_telegram_message(message) else st.error("Failed to send message.")
 
-if st.button("Run Backtest"):
-    with st.spinner("Running backtest on past 60 days..."):
-        backtest_result, signals = backtest_yesterday_lstm_signal(backtest_ticker)
-
-    if isinstance(backtest_result, dict):
-        st.success("Backtest Complete")
-        st.json(backtest_result)
+if st.button("Send Top 5 Strong Signals to Telegram"):
+    df_top = df[df["Strong Signal"] == "✅"].sort_values(by="Confidence", ascending=False).head(5)
+    message_lines = ["*Top 5 Strong Signals:*"]
+    for _, row in df_top.iterrows():
+        line = (
+            f"{row['Ticker']}: Sentiment {row['Sentiment']} ({row['Confidence']*100:.1f}%), "
+            f"Buy: {row['Buy Recommendation']}, Price: ${row['Price']}, Predicted: {row['Predicted Price']}"
+        )
+        message_lines.append(line)
+    message = "\n".join(message_lines)
+    if send_telegram_message(message):
+        st.success("Top 5 strong signal stocks sent!")
     else:
-        st.warning(signals)
-
-    if isinstance(signals, list):
-        st.write("Buy Signals Preview:")
-        preview_df = pd.DataFrame(signals, columns=["Date", "Predicted", "Previous Close", "Buy Signal"])
-        st.dataframe(preview_df.tail(20))
+        st.error("Failed to send top signals.")
