@@ -229,13 +229,13 @@ with tabs[0]:
 
     styled_df = (
         df.style
-        .map(highlight_signal, subset=["Strong Signal"])
-        .map(highlight_volume, subset=["Volume"])
+        .applymap(highlight_signal, subset=["Strong Signal"])
+        .applymap(highlight_volume, subset=["Volume"])
         .format({
             "Price": "${:,.2f}",
             "Predicted Price": lambda x: f"${x:.2f}" if isinstance(x, (float, int)) else x,
             "Stop Loss": lambda x: f"${x:.2f}" if isinstance(x, (float, int)) else x,
-            "Volume": ":,",
+            "Volume": "{:,}",
             "Confidence": "{:.2f}"
         })
     )
