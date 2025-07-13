@@ -8,8 +8,9 @@ import logging
 import requests
 from transformers import AutoTokenizer, AutoModelForSequenceClassification, pipeline
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
-from sklearn.linear_model import LinearRegression
+from sklearn.preprocessing import MinMaxScaler
 import numpy as np
 
 # === Secrets / Tokens ===
@@ -110,26 +111,73 @@ def calc_stop_loss(price):
 def is_strong_signal(pred_price, current_price, buy_recommendation):
     return pred_price and current_price and pred_price > current_price and buy_recommendation.lower() == "yes"
 
-def predict_price_lr(ticker):
-    """
-    Predict next day closing price with simple linear regression on last 30 days closing prices.
-    """
-    try:
-        data = yf.Ticker(ticker).history(period="30d")
-        if data.empty or len(data) < 10:
-            return None
-        prices = data['Close'].values.reshape(-1, 1)
-        days = np.arange(len(prices)).reshape(-1, 1)
+# === LSTM Model Definition ===
+class StockPriceLSTM(nn.Module):
+    def __init__(self, input_size=1, hidden_size=50, num_layers=2):
+        super(StockPriceLSTM, self).__init__()
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True)
+        self.linear = nn.Linear(hidden_size, 1)
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
 
-        model = LinearRegression()
-        model.fit(days, prices)
-        next_day = np.array([[len(prices)]])
-        pred_price = model.predict(next_day)[0][0]
+    def forward(self, x):
+        h0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size).to(x.device)
+        c0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size).to(x.device)
+        out, _ = self.lstm(x, (h0, c0))
+        out = self.linear(out[:, -1, :])
+        return out
+
+def prepare_data(df, sequence_length=20):
+    close_prices = df['Close'].values.reshape(-1, 1)
+    scaler = MinMaxScaler()
+    scaled = scaler.fit_transform(close_prices)
+    X, y = [], []
+    for i in range(len(scaled) - sequence_length):
+        X.append(scaled[i:i+sequence_length])
+        y.append(scaled[i+sequence_length])
+    X, y = np.array(X), np.array(y)
+    return X, y, scaler
+
+def predict_price_lstm(ticker):
+    try:
+        df = yf.Ticker(ticker).history(period="100d")
+        if df.empty or len(df) < 30:
+            return None
+
+        X, y, scaler = prepare_data(df)
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+        model = StockPriceLSTM()
+        model.to(device)
+        criterion = nn.MSELoss()
+        optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+
+        X_tensor = torch.tensor(X, dtype=torch.float32).to(device)
+        y_tensor = torch.tensor(y, dtype=torch.float32).to(device)
+
+        model.train()
+        epochs = 50  # You can increase epochs for better training but slower
+
+        for epoch in range(epochs):
+            optimizer.zero_grad()
+            outputs = model(X_tensor)
+            loss = criterion(outputs, y_tensor)
+            loss.backward()
+            optimizer.step()
+
+        model.eval()
+        last_seq = torch.tensor(X[-1:], dtype=torch.float32).to(device)
+        with torch.no_grad():
+            pred_scaled = model(last_seq).cpu().numpy()
+
+        pred_price = scaler.inverse_transform(pred_scaled)[0][0]
         return round(float(pred_price), 2)
+
     except Exception as e:
-        logging.error(f"Local price prediction error for {ticker}: {e}")
+        logging.error(f"LSTM price prediction error for {ticker}: {e}")
         return None
 
+# === Process Sector Stocks ===
 def process_sector(tickers):
     results = []
     for ticker in tickers:
@@ -138,7 +186,7 @@ def process_sector(tickers):
             continue
         headline = fetch_recent_headline(ticker)
         sentiment, confidence = call_local_sentiment_with_score(headline)
-        pred_price = predict_price_lr(ticker)  # Use local LR price prediction
+        pred_price = predict_price_lstm(ticker)  # Use LSTM price prediction now
         buy = call_hf_model_buy(ticker)
         stop_loss = calc_stop_loss(stock['price'])
         strong_signal = "✅" if is_strong_signal(pred_price, stock['price'], buy) else ""
