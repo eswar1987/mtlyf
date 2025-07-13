@@ -182,7 +182,7 @@ def process_sector(tickers):
         pred_price = predict_price_lstm(ticker)
         stop_loss = calc_stop_loss(stock['price'])
         strong_signal = "✅" if is_strong_signal(pred_price, stock['price'], confidence, stock['volume']) else ""
-        buy = "Yes" if strong_signal else "No"
+        buy = ticker if strong_signal else ""
 
         results.append({
             "Ticker": ticker,
@@ -209,10 +209,10 @@ def send_telegram_message(message):
         logging.error(f"Telegram send error: {e}")
         return False
 
-# === Streamlit Tabs ===
+# === Streamlit UI ===
+st.set_page_config(page_title="📊 AI Stock Sentiment Dashboard", layout="wide")
 tabs = st.tabs(["📊 Dashboard", "🔁 Backtest"])
 
-# === Dashboard Tab ===
 with tabs[0]:
     st.title("📊 AI Stock Sentiment Dashboard")
     sector = st.sidebar.selectbox("Select Sector", options=list(ETF_SECTORS.keys()))
@@ -227,14 +227,14 @@ with tabs[0]:
         st.warning("No data available for this sector.")
         st.stop()
 
-    buy_yes = df[df["Buy Recommendation"] == "Yes"].shape[0]
-    buy_no = df[df["Buy Recommendation"] == "No"].shape[0]
+    buy_yes = df[df["Buy Recommendation"] != ""].shape[0]
+    buy_no = df[df["Buy Recommendation"] == ""].shape[0]
     col1, col2 = st.columns(2)
     col1.metric("🟢 Buy Recommendations", buy_yes)
     col2.metric("🔴 Not Buy", buy_no)
 
     def highlight_buy(val):
-        return "color: green; font-weight: bold" if val == "Yes" else "color: red; font-weight: bold"
+        return "color: green; font-weight: bold" if val != "" else "color: red; font-weight: bold"
 
     def highlight_signal(val):
         return "background-color: #c8f7c5; font-weight: bold" if val == "✅" else ""
@@ -263,7 +263,8 @@ with tabs[0]:
     st.dataframe(styled_df, height=700)
 
     if st.button("Send Buy Summary to Telegram"):
-        message = f"*Buy Summary for {sector} Sector:*\nYes: {buy_yes}\nNo: {buy_no}"
+        buy_list = df[df["Buy Recommendation"] != ""]["Ticker"].tolist()
+        message = f"*Buy Recommendations for {sector} Sector:*\n" + "\n".join(buy_list) if buy_list else "No strong buy signals."
         st.success("Message sent!") if send_telegram_message(message) else st.error("Failed to send message.")
 
     if st.button("Send Top 5 Strong Signals to Telegram"):
@@ -280,28 +281,3 @@ with tabs[0]:
             st.success("Top 5 strong signal stocks sent!")
         else:
             st.error("Failed to send top signals.")
-
-# === Backtest Tab ===
-with tabs[1]:
-    st.title("🔁 Backtest Stock Prediction")
-    ticker_input = st.text_input("Enter a Ticker for Backtest (e.g., TSLA)")
-    if ticker_input:
-        try:
-            df = yf.Ticker(ticker_input).history(period="35d")
-            if df.shape[0] < 21:
-                st.warning("Not enough data for backtest.")
-            else:
-                df['Predicted'] = None
-                for i in range(20, len(df)-1):
-                    window_df = df.iloc[i-20:i]
-                    X, y, scaler = prepare_data(window_df)
-                    model = StockPriceLSTM()
-                    model.eval()
-                    X_tensor = torch.tensor(X, dtype=torch.float32)
-                    with torch.no_grad():
-                        pred = model(X_tensor).numpy()
-                    df.iloc[i+1, df.columns.get_loc('Predicted')] = scaler.inverse_transform(pred)[-1][0]
-
-                st.line_chart(df[['Close', 'Predicted']].dropna())
-        except Exception as e:
-            st.error(f"Error running backtest: {e}")
