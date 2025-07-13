@@ -18,7 +18,7 @@ client = InferenceClient(token=HF_API_TOKEN)
 
 # === Models ===
 MODELS = {
-    "price_prediction": "be814aa/FinMem-LLM-StockTrading",
+    "price_prediction": "SelvaprakashV/stock-prediction-model",
     "buy_recommendation": "fuchenru/Trading-Hero-LLM"
 }
 
@@ -83,8 +83,7 @@ def call_local_sentiment_with_score(text):
 def call_hf_model_price(ticker, retries=3):
     for _ in range(retries):
         try:
-            prompt = f"What is the projected price of {ticker} stock?"
-            output = client.text_generation(prompt=prompt, model=MODELS["price_prediction"])
+            output = client.text_generation(model=MODELS["price_prediction"], prompt=ticker)
             text = output.get("generated_text", "") if isinstance(output, dict) else output
             numbers = re.findall(r"\d+\.\d+", text)
             if numbers:
