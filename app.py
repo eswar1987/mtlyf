@@ -20,10 +20,10 @@ client = InferenceClient(token=HF_API_TOKEN)
 
 # === Models ===
 MODELS = {
-    "buy_recommendation": "fuchenru/Trading-Hero-LLM"
+    "buy_recommendation": "fuchenru/Trading-Hero-LLM",
+    "price_transformer": "microsoft/ts-mbart-large"  # example transformer model
 }
 
-# === Logging ===
 logging.basicConfig(level=logging.INFO)
 
 @st.cache_resource
@@ -43,31 +43,24 @@ def load_buy_rec_pipeline():
 buy_rec_pipeline = load_buy_rec_pipeline()
 
 ETF_SECTORS = {
-    'Tech': ["AAPL", "GOOG", "MSFT", "TSLA", "AMD", "NVDA", "INTC", "CRM", "ADBE", "AVGO", "ORCL", "CSCO", "QCOM", "NOW", "UBER", "SNOW", "TWLO", "WORK", "MDB", "ZI"],
-    'HealthCare': ["JNJ", "PFE", "MRK", "ABT", "GILD", "LLY", "BMY", "UNH", "AMGN", "CVS", "MDT", "ISRG", "ZTS", "REGN", "VRTX", "BIIB", "BAX", "HCA", "DGX", "IDXX"],
-    'Financials': ["JPM", "BAC", "C", "WFC", "GS", "MS", "USB", "AXP", "PNC", "SCHW", "BK", "BLK", "TFC", "CME", "MMC", "SPGI", "ICE", "STT", "FRC", "MTB"],
-    'ConsumerDiscretionary': ["AMZN", "TSLA", "HD", "MCD", "NKE", "SBUX", "LOW", "TJX", "GM", "F", "DG", "ROST", "CMG", "YUM", "DHI", "LEN", "BBY", "WHR", "LVS", "MAR"],
-    'Industrials': ["GE", "UPS", "CAT", "BA", "LMT", "MMM", "DE", "HON", "RTX", "GD", "EMR", "PNR", "ROK", "ETN", "CSX", "FDX", "CP", "XYL", "ITW", "DOV"],
-    'Energy': ["XOM", "CVX", "OXY", "SLB", "PXD", "EOG", "MPC", "VLO", "PSX", "COP", "HAL", "FTI", "BKR", "DVN", "CHK", "APA", "CXO", "MRO", "HES", "NBL"],
-    'Utilities': ["DUK", "SO", "NEE", "SRE", "EXC", "AEP", "XEL", "D", "ED", "PEG", "ES", "PPL", "WEC", "CMS", "EIX", "PNW", "FE", "ATO", "AES", "NRG"],
-    'BasicMaterials': ["LIN", "SHW", "ECL", "APD", "FCX", "NEM", "DD", "DOW", "CE", "PPG", "VMC", "LYB", "IP", "BLL", "MLM", "NUE", "PKG", "AVY", "PKX"],
-    'ETFs': ["SPY", "QQQ", "DIA", "IWM", "ARKK", "ARKW", "SMH", "IYT", "XLF", "XLE", "XLK", "XLY", "XLV", "XLI", "XLB", "XLU", "XLRE", "XLC", "VOO"],
-    'LeveragedETFs': ["TQQQ", "SQQQ", "SPXL", "SPXS", "UPRO", "SDOW", "SOXL", "SOXS", "LABU", "LABD", "FAS", "FAZ", "TNA", "TZA", "DRN", "DRV", "TECL", "TECS", "DFEN", "DUST"],
-    'Commodities': ["GC=F", "SI=F", "CL=F"]
+    'Tech': ["AAPL", "GOOG", "MSFT", "TSLA", "AMD", "NVDA", "INTC"],
+    'HealthCare': ["JNJ", "PFE", "MRK", "ABT"],
+    'Financials': ["JPM", "BAC", "C", "WFC"],
+    'Energy': ["XOM", "CVX", "SLB"]
 }
 
 def fetch_stock_data(ticker):
     try:
         stock = yf.Ticker(ticker)
-        hist = stock.history(period="1d")
+        hist = stock.history(period="30d")
         if hist.empty:
             raise ValueError("No historical data")
         price = hist['Close'].iloc[-1]
         volume = hist['Volume'].iloc[-1]
-        return {"price": price, "volume": volume}
+        return {"price": price, "volume": volume, "history": hist}
     except Exception as e:
         logging.error(f"Error fetching stock data for {ticker}: {e}")
-        return {"price": None, "volume": None}
+        return {"price": None, "volume": None, "history": None}
 
 def fetch_recent_headline(ticker):
     try:
@@ -92,27 +85,24 @@ def call_local_sentiment_with_score(text):
         logging.error(f"Sentiment model error: {e}")
         return "Neutral", 0.0
 
+def call_hf_model_buy(ticker):
+    prompt = f"Should I buy {ticker} stock? One word answer."
+    try:
+        results = buy_rec_pipeline(prompt)
+        if results and len(results) > 0:
+            label = results[0]['label'].lower()
+            if label in ['buy', 'yes', 'strong buy']:
+                return "Yes"
+            else:
+                return "No"
+    except Exception as e:
+        logging.error(f"Buy recommendation error for {ticker}: {e}")
+    return "No"
+
 def calc_stop_loss(price):
     return round(price * 0.95, 2) if price else None
 
-def is_strong_signal(pred_price, current_price, confidence, volume):
-    return (
-        pred_price and current_price and
-        pred_price > current_price and
-        confidence >= 0.6 and
-        volume > 1_000_000
-    )
-
-def send_telegram_message(message):
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    params = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
-    try:
-        response = requests.get(url, params=params)
-        return response.status_code == 200
-    except Exception as e:
-        logging.error(f"Telegram send error: {e}")
-        return False
-
+# === LSTM Model for fallback price prediction ===
 class StockPriceLSTM(nn.Module):
     def __init__(self, input_size=1, hidden_size=50, num_layers=2):
         super(StockPriceLSTM, self).__init__()
@@ -139,14 +129,11 @@ def prepare_data(df, sequence_length=20):
     X, y = np.array(X), np.array(y)
     return X, y, scaler
 
-def predict_price_lstm_backtest(ticker):
+def predict_price_lstm(df):
     try:
-        df = yf.Ticker(ticker).history(period="120d")
-        if df.empty or len(df) < 40:
-            return None, None
-
         X, y, scaler = prepare_data(df)
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
         model = StockPriceLSTM()
         model.to(device)
         criterion = nn.MSELoss()
@@ -156,7 +143,8 @@ def predict_price_lstm_backtest(ticker):
         y_tensor = torch.tensor(y, dtype=torch.float32).to(device)
 
         model.train()
-        for epoch in range(50):
+        epochs = 30
+        for epoch in range(epochs):
             optimizer.zero_grad()
             outputs = model(X_tensor)
             loss = criterion(outputs, y_tensor)
@@ -164,21 +152,76 @@ def predict_price_lstm_backtest(ticker):
             optimizer.step()
 
         model.eval()
+        last_seq = torch.tensor(X[-1:], dtype=torch.float32).to(device)
         with torch.no_grad():
-            predictions = model(X_tensor).cpu().numpy()
-            actuals = y_tensor.cpu().numpy()
+            pred_scaled = model(last_seq).cpu().numpy()
 
-        predictions = np.array(predictions).reshape(-1, 1)
-        actuals = np.array(actuals).reshape(-1, 1)
-        pred_prices = scaler.inverse_transform(predictions)
-        actual_prices = scaler.inverse_transform(actuals)
-
-        accuracy = 100 - np.mean(np.abs(pred_prices - actual_prices) / actual_prices) * 100
-        return round(float(pred_prices[-1][0]), 2), round(accuracy, 2)
-
+        pred_price = scaler.inverse_transform(pred_scaled)[0][0]
+        return round(float(pred_price), 2)
     except Exception as e:
-        logging.error(f"Backtest error for {ticker}: {e}")
-        return None, None
+        logging.error(f"LSTM price prediction error: {e}")
+        return None
+
+# === Hugging Face Time-Series Transformer Price Prediction ===
+def predict_price_transformer(ticker):
+    try:
+        # Get recent price history
+        df = yf.Ticker(ticker).history(period="30d")
+        if df.empty or len(df) < 20:
+            return None
+
+        # Prepare input sequence (just closing prices normalized)
+        close_prices = df['Close'].values[-20:]
+        min_p, max_p = close_prices.min(), close_prices.max()
+        norm_prices = (close_prices - min_p) / (max_p - min_p + 1e-9)
+
+        # The transformer expects input as list of floats
+        inputs = {
+            "inputs": norm_prices.tolist()
+        }
+        # Call Hugging Face inference API
+        response = client.text_generation(MODELS["price_transformer"], inputs)
+        # The model's output is expected as a predicted normalized price (float)
+        pred_norm_price = float(response.get('generated_text', '0').strip())
+        # Rescale back to original price range
+        pred_price = pred_norm_price * (max_p - min_p) + min_p
+
+        return round(pred_price, 2)
+    except Exception as e:
+        logging.error(f"Transformer price prediction error for {ticker}: {e}")
+        return None
+
+def aggregate_price_prediction(ticker):
+    data = fetch_stock_data(ticker)
+    df_hist = data.get("history")
+    if df_hist is None or len(df_hist) < 20:
+        return None
+    pred1 = predict_price_transformer(ticker)
+    pred2 = predict_price_lstm(df_hist)
+    preds = [p for p in [pred1, pred2] if p is not None]
+    if not preds:
+        return None
+    avg_pred = sum(preds) / len(preds)
+    return round(avg_pred, 2)
+
+def is_strong_signal(pred_price, current_price, buy_recommendation, confidence, volume):
+    return (
+        pred_price is not None and current_price is not None and
+        pred_price > current_price and
+        buy_recommendation.lower() == "yes" and
+        confidence >= 0.6 and
+        volume > 1_000_000
+    )
+
+def send_telegram_message(message):
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    params = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
+    try:
+        response = requests.get(url, params=params)
+        return response.status_code == 200
+    except Exception as e:
+        logging.error(f"Telegram send error: {e}")
+        return False
 
 # === Streamlit UI ===
 st.set_page_config(page_title="📊 AI Stock Sentiment Dashboard", layout="wide")
@@ -198,9 +241,10 @@ with tabs[0]:
                 continue
             headline = fetch_recent_headline(ticker)
             sentiment, confidence = call_local_sentiment_with_score(headline)
-            pred_price, _ = predict_price_lstm_backtest(ticker)
+            pred_price = aggregate_price_prediction(ticker)
+            buy = call_hf_model_buy(ticker)
             stop_loss = calc_stop_loss(stock['price'])
-            strong = "✅" if is_strong_signal(pred_price, stock['price'], confidence, stock['volume']) else ""
+            strong = "✅" if is_strong_signal(pred_price, stock['price'], buy, confidence, stock['volume']) else ""
 
             results.append({
                 "Ticker": ticker,
@@ -210,6 +254,7 @@ with tabs[0]:
                 "Headline": headline,
                 "Sentiment": sentiment,
                 "Confidence": confidence,
+                "Buy Recommendation": buy,
                 "Stop Loss": stop_loss,
                 "Strong Signal": strong
             })
@@ -267,15 +312,25 @@ with tabs[0]:
 
 with tabs[1]:
     st.title("🔁 Backtest Accuracy")
-    sector = st.selectbox("Select Sector to Backtest", list(ETF_SECTORS.keys()), key="backtest_sector")
-    tickers = ETF_SECTORS[sector]
+    sector_bt = st.selectbox("Select Sector to Backtest", list(ETF_SECTORS.keys()), key="backtest_sector")
+    tickers_bt = ETF_SECTORS[sector_bt]
     backtest_data = []
 
     with st.spinner("Running backtest predictions..."):
-        for ticker in tickers:
-            pred_price, accuracy = predict_price_lstm_backtest(ticker)
-            if pred_price and accuracy:
-                backtest_data.append({"Ticker": ticker, "Predicted Price": pred_price, "Accuracy (%)": accuracy})
+        for ticker in tickers_bt:
+            # Use LSTM for backtest accuracy for simplicity
+            df_hist = yf.Ticker(ticker).history(period="120d")
+            if df_hist.empty or len(df_hist) < 40:
+                continue
+            pred_price = predict_price_lstm(df_hist)
+            actual_price = df_hist['Close'].iloc[-1]
+            accuracy = 100 - abs(pred_price - actual_price) / actual_price * 100 if pred_price else 0
+            backtest_data.append({
+                "Ticker": ticker,
+                "Predicted Price": pred_price,
+                "Actual Price": round(actual_price, 2),
+                "Accuracy (%)": round(accuracy, 2)
+            })
 
     if backtest_data:
         df_bt = pd.DataFrame(backtest_data)
