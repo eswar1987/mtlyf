@@ -46,17 +46,10 @@ buy_rec_pipeline = load_buy_rec_pipeline()
 
 # === Sector Dictionary ===
 ETF_SECTORS = {
-   'Tech': ["AAPL", "GOOG", "MSFT", "TSLA", "AMD", "NVDA", "INTC", "CRM", "ADBE", "AVGO", "ORCL", "CSCO", "QCOM", "NOW", "UBER", "SNOW", "TWLO", "WORK", "MDB", "ZI"],
-    'HealthCare': ["JNJ", "PFE", "MRK", "ABT", "GILD", "LLY", "BMY", "UNH", "AMGN", "CVS", "MDT", "ISRG", "ZTS", "REGN", "VRTX", "BIIB", "BAX", "HCA", "DGX", "IDXX"],
-    'Financials': ["JPM", "BAC", "C", "WFC", "GS", "MS", "USB", "AXP", "PNC", "SCHW", "BK", "BLK", "TFC", "CME", "MMC", "SPGI", "ICE", "STT", "FRC", "MTB"],
-    'ConsumerDiscretionary': ["AMZN", "TSLA", "HD", "MCD", "NKE", "SBUX", "LOW", "TJX", "GM", "F", "DG", "ROST", "CMG", "YUM", "DHI", "LEN", "BBY", "WHR", "LVS", "MAR"],
-    'Industrials': ["GE", "UPS", "CAT", "BA", "LMT", "MMM", "DE", "HON", "RTX", "GD", "EMR", "PNR", "ROK", "ETN", "CSX", "FDX", "CP", "XYL", "ITW", "DOV"],
-    'Energy': ["XOM", "CVX", "OXY", "SLB", "PXD", "EOG", "MPC", "VLO", "PSX", "COP", "HAL", "FTI", "BKR", "DVN", "CHK", "APA", "CXO", "MRO", "HES", "NBL"],
-    'Utilities': ["DUK", "SO", "NEE", "SRE", "EXC", "AEP", "XEL", "D", "ED", "PEG", "ES", "PPL", "WEC", "CMS", "EIX", "PNW", "FE", "ATO", "AES", "NRG"],
-    'BasicMaterials': ["LIN", "SHW", "ECL", "APD", "FCX", "NEM", "DD", "DOW", "CE", "PPG", "VMC", "LYB", "IP", "BLL", "MLM", "NUE", "PKG", "AVY", "PKX"],
-    'ETFs': ["SPY", "QQQ", "DIA", "IWM", "ARKK", "ARKW", "SMH", "IYT", "XLF", "XLE", "XLK", "XLY", "XLV", "XLI", "XLB", "XLU", "XLRE", "XLC", "VOO"],
-    'LeveragedETFs': ["TQQQ", "SQQQ", "SPXL", "SPXS", "UPRO", "SDOW", "SOXL", "SOXS", "LABU", "LABD", "FAS", "FAZ", "TNA", "TZA", "DRN", "DRV", "TECL", "TECS", "DFEN", "DUST"],
-    'Commodities': ["GC=F", "SI=F", "CL=F"]
+    'Tech': ["AAPL", "GOOG", "MSFT", "TSLA", "AMD", "NVDA", "INTC"],
+    'HealthCare': ["JNJ", "PFE", "MRK", "ABT"],
+    'Financials': ["JPM", "BAC", "C", "WFC"],
+    'Energy': ["XOM", "CVX", "SLB"]
 }
 
 # === Helper Functions ===
@@ -107,7 +100,17 @@ def is_strong_signal(pred_price, current_price, confidence, volume):
         volume > 1_000_000
     )
 
-# === LSTM Model Definition ===
+def send_telegram_message(message):
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    params = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
+    try:
+        response = requests.get(url, params=params)
+        return response.status_code == 200
+    except Exception as e:
+        logging.error(f"Telegram send error: {e}")
+        return False
+
+# === LSTM Class ===
 class StockPriceLSTM(nn.Module):
     def __init__(self, input_size=1, hidden_size=50, num_layers=2):
         super(StockPriceLSTM, self).__init__()
@@ -134,15 +137,14 @@ def prepare_data(df, sequence_length=20):
     X, y = np.array(X), np.array(y)
     return X, y, scaler
 
-def predict_price_lstm(ticker):
+def predict_price_lstm_backtest(ticker):
     try:
-        df = yf.Ticker(ticker).history(period="100d")
-        if df.empty or len(df) < 30:
-            return None
+        df = yf.Ticker(ticker).history(period="120d")
+        if df.empty or len(df) < 40:
+            return None, None
 
         X, y, scaler = prepare_data(df)
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
         model = StockPriceLSTM()
         model.to(device)
         criterion = nn.MSELoss()
@@ -160,81 +162,69 @@ def predict_price_lstm(ticker):
             optimizer.step()
 
         model.eval()
-        last_seq = torch.tensor(X[-1:], dtype=torch.float32).to(device)
         with torch.no_grad():
-            pred_scaled = model(last_seq).cpu().numpy()
+            predictions = model(X_tensor).cpu().numpy()
+            actuals = y_tensor.cpu().numpy()
 
-        pred_price = scaler.inverse_transform(pred_scaled)[0][0]
-        return round(float(pred_price), 2)
+        predictions = np.array(predictions).reshape(-1, 1)
+        actuals = np.array(actuals).reshape(-1, 1)
+        pred_prices = scaler.inverse_transform(predictions)
+        actual_prices = scaler.inverse_transform(actuals)
+
+        accuracy = 100 - np.mean(np.abs(pred_prices - actual_prices) / actual_prices) * 100
+        return round(float(pred_prices[-1][0]), 2), round(accuracy, 2)
 
     except Exception as e:
-        logging.error(f"LSTM price prediction error for {ticker}: {e}")
-        return None
+        logging.error(f"Backtest error for {ticker}: {e}")
+        return None, None
 
-def process_sector(tickers):
-    results = []
-    for ticker in tickers:
-        stock = fetch_stock_data(ticker)
-        if not stock or stock['price'] is None:
-            continue
-        headline = fetch_recent_headline(ticker)
-        sentiment, confidence = call_local_sentiment_with_score(headline)
-        pred_price = predict_price_lstm(ticker)
-        stop_loss = calc_stop_loss(stock['price'])
-        strong_signal = "✅" if is_strong_signal(pred_price, stock['price'], confidence, stock['volume']) else ""
-        buy = ticker if strong_signal else ""
-
-        results.append({
-            "Ticker": ticker,
-            "Price": round(stock['price'], 2),
-            "Volume": int(stock['volume']) if stock['volume'] else 0,
-            "Predicted Price": pred_price if pred_price else "N/A",
-            "Headline": headline,
-            "Sentiment": sentiment,
-            "Confidence": confidence,
-            "Buy Recommendation": buy,
-            "Stop Loss": stop_loss,
-            "Strong Signal": strong_signal
-        })
-        time.sleep(0.5)
-    return results
-
-def send_telegram_message(message):
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    params = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
-    try:
-        response = requests.get(url, params=params)
-        return response.status_code == 200
-    except Exception as e:
-        logging.error(f"Telegram send error: {e}")
-        return False
-
-# === Streamlit UI ===
+# === Streamlit Tabs ===
 st.set_page_config(page_title="📊 AI Stock Sentiment Dashboard", layout="wide")
 tabs = st.tabs(["📊 Dashboard", "🔁 Backtest"])
 
+# === DASHBOARD TAB ===
 with tabs[0]:
     st.title("📊 AI Stock Sentiment Dashboard")
-    sector = st.sidebar.selectbox("Select Sector", options=list(ETF_SECTORS.keys()))
-    st.sidebar.markdown("Data powered by PyTorch FinBERT + HuggingFace + Yahoo Finance")
+    sector = st.selectbox("Select Sector", options=list(ETF_SECTORS.keys()))
+    tickers = ETF_SECTORS[sector]
 
-    with st.spinner(f"Processing data for {sector} sector..."):
-        tickers = ETF_SECTORS[sector]
-        data = process_sector(tickers)
-        df = pd.DataFrame(data)
+    results = []
+    with st.spinner("Analyzing tickers..."):
+        for ticker in tickers:
+            stock = fetch_stock_data(ticker)
+            if not stock or stock['price'] is None:
+                continue
+            headline = fetch_recent_headline(ticker)
+            sentiment, confidence = call_local_sentiment_with_score(headline)
+            pred_price, _ = predict_price_lstm_backtest(ticker)
+            stop_loss = calc_stop_loss(stock['price'])
+            strong_signal = "✅" if is_strong_signal(pred_price, stock['price'], confidence, stock['volume']) else ""
 
-    if df.empty:
-        st.warning("No data available for this sector.")
-        st.stop()
+            results.append({
+                "Ticker": ticker,
+                "Price": round(stock['price'], 2),
+                "Volume": int(stock['volume']) if stock['volume'] else 0,
+                "Predicted Price": pred_price if pred_price else "N/A",
+                "Headline": headline,
+                "Sentiment": sentiment,
+                "Confidence": confidence,
+                "Buy Recommendation": "Yes" if strong_signal == "✅" else "No",
+                "Stop Loss": stop_loss,
+                "Strong Signal": strong_signal
+            })
+            time.sleep(0.5)
 
-    buy_yes = df[df["Buy Recommendation"] != ""].shape[0]
-    buy_no = df[df["Buy Recommendation"] == ""].shape[0]
+    df = pd.DataFrame(results)
+
+    buy_yes = df[df["Buy Recommendation"] == "Yes"]
+    buy_no = df[df["Buy Recommendation"] == "No"]
+
     col1, col2 = st.columns(2)
-    col1.metric("🟢 Buy Recommendations", buy_yes)
-    col2.metric("🔴 Not Buy", buy_no)
+    col1.metric("🟢 Buy Recommendations", len(buy_yes))
+    col2.metric("🔴 Not Buy", len(buy_no))
 
     def highlight_buy(val):
-        return "color: green; font-weight: bold" if val != "" else "color: red; font-weight: bold"
+        return "color: green; font-weight: bold" if val == "Yes" else "color: red; font-weight: bold"
 
     def highlight_signal(val):
         return "background-color: #c8f7c5; font-weight: bold" if val == "✅" else ""
@@ -259,32 +249,30 @@ with tabs[0]:
             "Confidence": "{:.2f}"
         })
     )
-
     st.dataframe(styled_df, height=700)
 
     if st.button("Send Buy Summary to Telegram"):
-        df_top = df[df["Strong Signal"] == "✅"].sort_values(by="Confidence", ascending=False).head(5)
-        message_lines = [f"*Buy Recommendations for {sector} Sector:*"]
-        for _, row in df_top.iterrows():
-            line = (
-                f"{row['Ticker']}: {row['Sentiment']} ({row['Confidence']*100:.1f}%), "
-                f"Price: ${row['Price']}, Predicted: {row['Predicted Price']}"
-            )
-            message_lines.append(line)
-        message = "\n".join(message_lines) if not df_top.empty else "No strong buy signals."
-        st.success("Message sent!") if send_telegram_message(message) else st.error("Failed to send message.")
-
-    if st.button("Send Top 5 Strong Signals to Telegram"):
-        df_top = df[df["Strong Signal"] == "✅"].sort_values(by="Confidence", ascending=False).head(5)
-        message_lines = ["*Top 5 Strong Signals:*"]
-        for _, row in df_top.iterrows():
-            line = (
-                f"{row['Ticker']}: Sentiment {row['Sentiment']} ({row['Confidence']*100:.1f}%), "
-                f"Buy: {row['Buy Recommendation']}, Price: ${row['Price']}, Predicted: {row['Predicted Price']}"
-            )
-            message_lines.append(line)
+        message_lines = [f"*Buy Summary for {sector} Sector:*"]
+        for _, row in buy_yes.iterrows():
+            message_lines.append(f"{row['Ticker']} @ ${row['Price']} → Pred: ${row['Predicted Price']}, Conf: {row['Confidence']*100:.1f}%")
         message = "\n".join(message_lines)
-        if send_telegram_message(message):
-            st.success("Top 5 strong signal stocks sent!")
-        else:
-            st.error("Failed to send top signals.")
+        st.success("Summary sent!") if send_telegram_message(message) else st.error("Failed to send.")
+
+# === BACKTEST TAB ===
+with tabs[1]:
+    st.title("🔁 Backtest Accuracy")
+    sector = st.selectbox("Select Sector to Backtest", list(ETF_SECTORS.keys()), key="backtest_sector")
+    tickers = ETF_SECTORS[sector]
+    backtest_data = []
+
+    with st.spinner("Running backtest predictions..."):
+        for ticker in tickers:
+            pred_price, accuracy = predict_price_lstm_backtest(ticker)
+            if pred_price and accuracy:
+                backtest_data.append({"Ticker": ticker, "Predicted Price": pred_price, "Accuracy (%)": accuracy})
+
+    if backtest_data:
+        df_bt = pd.DataFrame(backtest_data)
+        st.dataframe(df_bt)
+    else:
+        st.warning("No backtest results available for this sector.")
