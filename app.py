@@ -62,7 +62,7 @@ def fetch_recent_headline(ticker):
         stock = yf.Ticker(ticker)
         news = stock.news
         if news and len(news) > 0:
-            return news[0]['title']
+            return news[0].get('title', f"{ticker} stock")
     except Exception as e:
         logging.warning(f"No news for {ticker}: {e}")
     return f"{ticker} stock"
@@ -83,7 +83,8 @@ def call_local_sentiment_with_score(text):
 def call_hf_model_price(ticker, retries=3):
     for _ in range(retries):
         try:
-            output = client.text_generation(model=MODELS["price_prediction"], prompt=ticker)
+            prompt = f"What is the projected price of {ticker} stock?"
+            output = client.text_generation(prompt=prompt, model=MODELS["price_prediction"])
             text = output.get("generated_text", "") if isinstance(output, dict) else output
             numbers = re.findall(r"\d+\.\d+", text)
             if numbers:
@@ -94,14 +95,12 @@ def call_hf_model_price(ticker, retries=3):
     return None
 
 def call_hf_model_buy(ticker, retries=3):
-    prompt = f"Should I buy {ticker} stock? One word answer."
     for _ in range(retries):
         try:
-            output = client.text_generation(prompt=prompt, model=MODELS["buy_recommendation"])
-            text = output.get("generated_text", "") if isinstance(output, dict) else output
-            match = re.search(r"\b(yes|no|buy|hold|sell|strong buy|strong sell)\b", text, re.I)
-            if match:
-                return "Yes" if match.group(0).lower() in ["yes", "buy", "strong buy"] else "No"
+            output = client.text_classification(inputs=f"Should I buy {ticker} stock?", model=MODELS["buy_recommendation"])
+            if isinstance(output, list) and len(output) > 0:
+                label = output[0]['label'].lower()
+                return "Yes" if label in ["yes", "buy", "strong buy"] else "No"
             time.sleep(1)
         except Exception as e:
             logging.error(f"Buy recommendation error for {ticker}: {e}")
