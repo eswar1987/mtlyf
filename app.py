@@ -35,7 +35,7 @@ def load_sentiment_model():
 
 tokenizer, sentiment_model = load_sentiment_model()
 
-# === Sectors ===
+# === Sector Dictionary ===
 ETF_SECTORS = {
     'Tech': ["AAPL", "GOOG", "MSFT", "TSLA", "AMD", "NVDA", "INTC", "CRM", "ADBE", "AVGO", "ORCL", "CSCO", "QCOM", "NOW", "UBER", "SNOW", "TWLO", "WORK", "MDB", "ZI"],
     'HealthCare': ["JNJ", "PFE", "MRK", "ABT", "GILD", "LLY", "BMY", "UNH", "AMGN", "CVS", "MDT", "ISRG", "ZTS", "REGN", "VRTX", "BIIB", "BAX", "HCA", "DGX", "IDXX"],
@@ -71,7 +71,7 @@ def fetch_recent_headline(ticker):
             return news[0]['title']
     except Exception as e:
         logging.warning(f"No news for {ticker}: {e}")
-    return f"{ticker} stock"  # fallback
+    return f"{ticker} stock"
 
 def call_local_sentiment_with_score(text):
     try:
@@ -89,7 +89,7 @@ def call_local_sentiment_with_score(text):
 def call_hf_model_price(ticker, retries=3):
     for _ in range(retries):
         try:
-            output = client.text_generation(MODELS["price_prediction"], ticker)
+            output = client.text_generation(prompt=ticker, model=MODELS["price_prediction"])
             text = output.get("generated_text", "") if isinstance(output, dict) else output
             numbers = re.findall(r"\d+\.\d+", text)
             if numbers:
@@ -103,7 +103,7 @@ def call_hf_model_buy(ticker, retries=3):
     prompt = f"Should I buy {ticker} stock? One word answer."
     for _ in range(retries):
         try:
-            output = client.text_generation(MODELS["buy_recommendation"], prompt)
+            output = client.text_generation(prompt=prompt, model=MODELS["buy_recommendation"])
             text = output.get("generated_text", "") if isinstance(output, dict) else output
             match = re.search(r"\b(yes|no|buy|hold|sell|strong buy|strong sell)\b", text, re.I)
             if match:
@@ -174,14 +174,12 @@ if df.empty:
     st.warning("No data available for this sector.")
     st.stop()
 
-# Metrics
 buy_yes = df[df["Buy Recommendation"] == "Yes"].shape[0]
 buy_no = df[df["Buy Recommendation"] == "No"].shape[0]
 col1, col2 = st.columns(2)
 col1.metric("🟢 Buy Recommendations", buy_yes)
 col2.metric("🔴 Not Buy", buy_no)
 
-# Styling
 def highlight_buy(val):
     return "color: green; font-weight: bold" if val == "Yes" else "color: red; font-weight: bold"
 
@@ -204,7 +202,7 @@ styled_df = (
         "Price": "${:,.2f}",
         "Predicted Price": lambda x: f"${x:.2f}" if isinstance(x, (float, int)) else x,
         "Stop Loss": lambda x: f"${x:.2f}" if isinstance(x, (float, int)) else x,
-        "Volume": "{:,}",
+        "Volume": ",",
         "Confidence": "{:.2f}"
     })
 )
@@ -214,3 +212,20 @@ st.dataframe(styled_df, height=700)
 if st.button("Send Buy Summary to Telegram"):
     message = f"*Buy Summary for {sector} Sector:*\nYes: {buy_yes}\nNo: {buy_no}"
     st.success("Message sent!") if send_telegram_message(message) else st.error("Failed to send message.")
+
+if st.button("Send Top 20 Confidence Stocks to Telegram"):
+    df_top_conf = df.sort_values(by="Confidence", ascending=False).head(20)
+    message_lines = ["*Top 20 High-Confidence Sentiment Stocks:*"]
+    for _, row in df_top_conf.iterrows():
+        line = (
+            f"{row['Ticker']}: "
+            f"{row['Sentiment']} ({row['Confidence']*100:.1f}%), "
+            f"Buy: {row['Buy Recommendation']}, "
+            f"Price: ${row['Price']}"
+        )
+        message_lines.append(line)
+    message = "\n".join(message_lines)
+    if send_telegram_message(message):
+        st.success("Top 20 confidence stocks message sent!")
+    else:
+        st.error("Failed to send top 20 confidence stocks.")
