@@ -18,7 +18,7 @@ client = InferenceClient(token=HF_API_TOKEN)
 
 # === Models ===
 MODELS = {
-    "price_prediction": "SelvaprakashV/stock-prediction-model",
+    "price_prediction": "be814aa/FinMem-LLM-StockTrading",
     "buy_recommendation": "fuchenru/Trading-Hero-LLM"
 }
 
@@ -37,28 +37,22 @@ tokenizer, sentiment_model = load_sentiment_model()
 
 # === Sector Dictionary ===
 ETF_SECTORS = {
-    'Tech': ["AAPL", "GOOG", "MSFT", "TSLA", "AMD", "NVDA", "INTC", "CRM", "ADBE", "AVGO", "ORCL", "CSCO", "QCOM", "NOW", "UBER", "SNOW", "TWLO", "WORK", "MDB", "ZI"],
-    'HealthCare': ["JNJ", "PFE", "MRK", "ABT", "GILD", "LLY", "BMY", "UNH", "AMGN", "CVS", "MDT", "ISRG", "ZTS", "REGN", "VRTX", "BIIB", "BAX", "HCA", "DGX", "IDXX"],
-    'Financials': ["JPM", "BAC", "C", "WFC", "GS", "MS", "USB", "AXP", "PNC", "SCHW", "BK", "BLK", "TFC", "CME", "MMC", "SPGI", "ICE", "STT", "FRC", "MTB"],
-    'ConsumerDiscretionary': ["AMZN", "TSLA", "HD", "MCD", "NKE", "SBUX", "LOW", "TJX", "GM", "F", "DG", "ROST", "CMG", "YUM", "DHI", "LEN", "BBY", "WHR", "LVS", "MAR"],
-    'Industrials': ["GE", "UPS", "CAT", "BA", "LMT", "MMM", "DE", "HON", "RTX", "GD", "EMR", "PNR", "ROK", "ETN", "CSX", "FDX", "CP", "XYL", "ITW", "DOV"],
-    'Energy': ["XOM", "CVX", "OXY", "SLB", "PXD", "EOG", "MPC", "VLO", "PSX", "COP", "HAL", "FTI", "BKR", "DVN", "CHK", "APA", "CXO", "MRO", "HES", "NBL"],
-    'Utilities': ["DUK", "SO", "NEE", "SRE", "EXC", "AEP", "XEL", "D", "ED", "PEG", "ES", "PPL", "WEC", "CMS", "EIX", "PNW", "FE", "ATO", "AES", "NRG"],
-    'BasicMaterials': ["LIN", "SHW", "ECL", "APD", "FCX", "NEM", "DD", "DOW", "CE", "PPG", "VMC", "LYB", "IP", "BLL", "MLM", "NUE", "PKG", "AVY", "PKX"],
-    'ETFs': ["SPY", "QQQ", "DIA", "IWM", "ARKK", "ARKW", "SMH", "IYT", "XLF", "XLE", "XLK", "XLY", "XLV", "XLI", "XLB", "XLU", "XLRE", "XLC", "VOO"],
-    'LeveragedETFs': ["TQQQ", "SQQQ", "SPXL", "SPXS", "UPRO", "SDOW", "SOXL", "SOXS", "LABU", "LABD", "FAS", "FAZ", "TNA", "TZA", "DRN", "DRV", "TECL", "TECS", "DFEN", "DUST"],
-    'Commodities': ["GC=F", "SI=F", "CL=F"]
+    'Tech': ["AAPL", "GOOG", "MSFT", "TSLA", "AMD", "NVDA", "INTC"],
+    'HealthCare': ["JNJ", "PFE", "MRK", "ABT"],
+    'Financials': ["JPM", "BAC", "C", "WFC"],
+    'Energy': ["XOM", "CVX", "SLB"]
 }
 
 # === Helper Functions ===
 def fetch_stock_data(ticker):
     try:
         stock = yf.Ticker(ticker)
-        info = stock.info
-        return {
-            "price": info.get('regularMarketPrice') or info.get('previousClose'),
-            "volume": info.get('volume')
-        }
+        hist = stock.history(period="1d")
+        if hist.empty:
+            raise ValueError("No historical data")
+        price = hist['Close'].iloc[-1]
+        volume = hist['Volume'].iloc[-1]
+        return {"price": price, "volume": volume}
     except Exception as e:
         logging.error(f"Error fetching stock data for {ticker}: {e}")
         return {"price": None, "volume": None}
@@ -89,7 +83,8 @@ def call_local_sentiment_with_score(text):
 def call_hf_model_price(ticker, retries=3):
     for _ in range(retries):
         try:
-            output = client.text_generation(prompt=ticker, model=MODELS["price_prediction"])
+            prompt = f"What is the projected price of {ticker} stock?"
+            output = client.text_generation(prompt=prompt, model=MODELS["price_prediction"])
             text = output.get("generated_text", "") if isinstance(output, dict) else output
             numbers = re.findall(r"\d+\.\d+", text)
             if numbers:
@@ -135,7 +130,7 @@ def process_sector(tickers):
         results.append({
             "Ticker": ticker,
             "Price": round(stock['price'], 2),
-            "Volume": stock['volume'] or 0,
+            "Volume": int(stock['volume']) if stock['volume'] else 0,
             "Predicted Price": round(pred_price, 2) if pred_price else "N/A",
             "Headline": headline,
             "Sentiment": sentiment,
@@ -221,7 +216,8 @@ if st.button("Send Top 20 Confidence Stocks to Telegram"):
             f"{row['Ticker']}: "
             f"{row['Sentiment']} ({row['Confidence']*100:.1f}%), "
             f"Buy: {row['Buy Recommendation']}, "
-            f"Price: ${row['Price']}"
+            f"Price: ${row['Price']}, "
+            f"Predicted: {row['Predicted Price']}"
         )
         message_lines.append(line)
     message = "\n".join(message_lines)
