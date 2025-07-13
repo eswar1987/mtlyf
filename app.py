@@ -26,7 +26,6 @@ MODELS = {
 # === Logging ===
 logging.basicConfig(level=logging.INFO)
 
-# === Load FinBERT Sentiment Model ===
 @st.cache_resource
 def load_sentiment_model():
     model_name = "ProsusAI/finbert"
@@ -36,7 +35,6 @@ def load_sentiment_model():
 
 tokenizer, sentiment_model = load_sentiment_model()
 
-# === Load Buy Recommendation Classification Pipeline ===
 @st.cache_resource
 def load_buy_rec_pipeline():
     model_name = MODELS["buy_recommendation"]
@@ -44,7 +42,6 @@ def load_buy_rec_pipeline():
 
 buy_rec_pipeline = load_buy_rec_pipeline()
 
-# === Sector Dictionary ===
 ETF_SECTORS = {
     'Tech': ["AAPL", "GOOG", "MSFT", "TSLA", "AMD", "NVDA", "INTC"],
     'HealthCare': ["JNJ", "PFE", "MRK", "ABT"],
@@ -52,7 +49,6 @@ ETF_SECTORS = {
     'Energy': ["XOM", "CVX", "SLB"]
 }
 
-# === Helper Functions ===
 def fetch_stock_data(ticker):
     try:
         stock = yf.Ticker(ticker)
@@ -110,7 +106,6 @@ def send_telegram_message(message):
         logging.error(f"Telegram send error: {e}")
         return False
 
-# === LSTM Class ===
 class StockPriceLSTM(nn.Module):
     def __init__(self, input_size=1, hidden_size=50, num_layers=2):
         super(StockPriceLSTM, self).__init__()
@@ -178,18 +173,18 @@ def predict_price_lstm_backtest(ticker):
         logging.error(f"Backtest error for {ticker}: {e}")
         return None, None
 
-# === Streamlit Tabs ===
+# === Streamlit UI ===
 st.set_page_config(page_title="📊 AI Stock Sentiment Dashboard", layout="wide")
 tabs = st.tabs(["📊 Dashboard", "🔁 Backtest"])
 
-# === DASHBOARD TAB ===
 with tabs[0]:
     st.title("📊 AI Stock Sentiment Dashboard")
-    sector = st.selectbox("Select Sector", options=list(ETF_SECTORS.keys()))
-    tickers = ETF_SECTORS[sector]
+    sector = st.sidebar.selectbox("Select Sector", options=list(ETF_SECTORS.keys()))
+    st.sidebar.markdown("Data powered by PyTorch FinBERT + HuggingFace + Yahoo Finance")
 
+    tickers = ETF_SECTORS[sector]
     results = []
-    with st.spinner("Analyzing tickers..."):
+    with st.spinner("Processing data..."):
         for ticker in tickers:
             stock = fetch_stock_data(ticker)
             if not stock or stock['price'] is None:
@@ -198,7 +193,7 @@ with tabs[0]:
             sentiment, confidence = call_local_sentiment_with_score(headline)
             pred_price, _ = predict_price_lstm_backtest(ticker)
             stop_loss = calc_stop_loss(stock['price'])
-            strong_signal = "✅" if is_strong_signal(pred_price, stock['price'], confidence, stock['volume']) else ""
+            strong = "✅" if is_strong_signal(pred_price, stock['price'], confidence, stock['volume']) else ""
 
             results.append({
                 "Ticker": ticker,
@@ -208,23 +203,19 @@ with tabs[0]:
                 "Headline": headline,
                 "Sentiment": sentiment,
                 "Confidence": confidence,
-                "Buy Recommendation": "Yes" if strong_signal == "✅" else "No",
                 "Stop Loss": stop_loss,
-                "Strong Signal": strong_signal
+                "Strong Signal": strong
             })
             time.sleep(0.5)
 
     df = pd.DataFrame(results)
-
-    buy_yes = df[df["Buy Recommendation"] == "Yes"]
-    buy_no = df[df["Buy Recommendation"] == "No"]
+    if df.empty:
+        st.warning("No data available.")
+        st.stop()
 
     col1, col2 = st.columns(2)
-    col1.metric("🟢 Buy Recommendations", len(buy_yes))
-    col2.metric("🔴 Not Buy", len(buy_no))
-
-    def highlight_buy(val):
-        return "color: green; font-weight: bold" if val == "Yes" else "color: red; font-weight: bold"
+    col1.metric("✅ Strong Signals", df[df["Strong Signal"] == "✅"].shape[0])
+    col2.metric("Total Stocks", df.shape[0])
 
     def highlight_signal(val):
         return "background-color: #c8f7c5; font-weight: bold" if val == "✅" else ""
@@ -238,27 +229,35 @@ with tabs[0]:
 
     styled_df = (
         df.style
-        .applymap(highlight_buy, subset=["Buy Recommendation"])
-        .applymap(highlight_signal, subset=["Strong Signal"])
-        .applymap(highlight_volume, subset=["Volume"])
+        .map(highlight_signal, subset=["Strong Signal"])
+        .map(highlight_volume, subset=["Volume"])
         .format({
             "Price": "${:,.2f}",
             "Predicted Price": lambda x: f"${x:.2f}" if isinstance(x, (float, int)) else x,
             "Stop Loss": lambda x: f"${x:.2f}" if isinstance(x, (float, int)) else x,
-            "Volume": "{:,}",
+            "Volume": ":,",
             "Confidence": "{:.2f}"
         })
     )
+
     st.dataframe(styled_df, height=700)
 
-    if st.button("Send Buy Summary to Telegram"):
-        message_lines = [f"*Buy Summary for {sector} Sector:*"]
-        for _, row in buy_yes.iterrows():
-            message_lines.append(f"{row['Ticker']} @ ${row['Price']} → Pred: ${row['Predicted Price']}, Conf: {row['Confidence']*100:.1f}%")
-        message = "\n".join(message_lines)
-        st.success("Summary sent!") if send_telegram_message(message) else st.error("Failed to send.")
+    if st.button("Send Top 5 Strong Signals to Telegram"):
+        top5 = df[df["Strong Signal"] == "✅"].sort_values(by="Confidence", ascending=False).head(5)
+        if top5.empty:
+            st.warning("No strong signals to send.")
+        else:
+            lines = ["*Top 5 Strong Buy Signals:*"]
+            for _, row in top5.iterrows():
+                lines.append(f"{row['Ticker']} | {row['Sentiment']} ({row['Confidence']*100:.1f}%) | Price: ${row['Price']} | Predicted: {row['Predicted Price']}")
+            msg = "\n".join(lines)
+            if send_telegram_message(msg):
+                st.success("Telegram message sent.")
+            else:
+                st.error("Failed to send message.")
 
-# === BACKTEST TAB ===
+    st.download_button("📥 Download Signals CSV", df.to_csv(index=False), "signals.csv")
+
 with tabs[1]:
     st.title("🔁 Backtest Accuracy")
     sector = st.selectbox("Select Sector to Backtest", list(ETF_SECTORS.keys()), key="backtest_sector")
@@ -274,5 +273,6 @@ with tabs[1]:
     if backtest_data:
         df_bt = pd.DataFrame(backtest_data)
         st.dataframe(df_bt)
+        st.download_button("📥 Download Backtest CSV", df_bt.to_csv(index=False), "backtest.csv")
     else:
         st.warning("No backtest results available for this sector.")
