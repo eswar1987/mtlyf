@@ -6,7 +6,7 @@ import time
 import re
 import logging
 import requests
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
+from transformers import AutoTokenizer, AutoModelForSequenceClassification, pipeline
 import torch
 import torch.nn.functional as F
 
@@ -34,6 +34,14 @@ def load_sentiment_model():
     return tokenizer, model
 
 tokenizer, sentiment_model = load_sentiment_model()
+
+# === Load Buy Recommendation Classification Pipeline ===
+@st.cache_resource
+def load_buy_rec_pipeline():
+    model_name = MODELS["buy_recommendation"]
+    return pipeline("text-classification", model=model_name, tokenizer=model_name)
+
+buy_rec_pipeline = load_buy_rec_pipeline()
 
 # === Sector Dictionary ===
 ETF_SECTORS = {
@@ -94,16 +102,19 @@ def call_hf_model_price(ticker, retries=3):
             logging.error(f"Price prediction error for {ticker}: {e}")
     return None
 
-def call_hf_model_buy(ticker, retries=3):
-    for _ in range(retries):
-        try:
-            output = client.text_classification(inputs=f"Should I buy {ticker} stock?", model=MODELS["buy_recommendation"])
-            if isinstance(output, list) and len(output) > 0:
-                label = output[0]['label'].lower()
-                return "Yes" if label in ["yes", "buy", "strong buy"] else "No"
-            time.sleep(1)
-        except Exception as e:
-            logging.error(f"Buy recommendation error for {ticker}: {e}")
+def call_hf_model_buy(ticker):
+    prompt = f"Should I buy {ticker} stock? One word answer."
+    try:
+        results = buy_rec_pipeline(prompt)
+        # The output format is a list of dicts, e.g. [{'label': 'BUY', 'score': 0.9}]
+        if results and len(results) > 0:
+            label = results[0]['label'].lower()
+            if label in ['buy', 'yes', 'strong buy']:
+                return "Yes"
+            else:
+                return "No"
+    except Exception as e:
+        logging.error(f"Buy recommendation error for {ticker}: {e}")
     return "No"
 
 def calc_stop_loss(price):
@@ -195,7 +206,7 @@ styled_df = (
         "Price": "${:,.2f}",
         "Predicted Price": lambda x: f"${x:.2f}" if isinstance(x, (float, int)) else x,
         "Stop Loss": lambda x: f"${x:.2f}" if isinstance(x, (float, int)) else x,
-        "Volume": ",",
+        "Volume": "{:,}",
         "Confidence": "{:.2f}"
     })
 )
