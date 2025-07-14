@@ -11,6 +11,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from sklearn.preprocessing import MinMaxScaler
 import numpy as np
+from concurrent.futures import ThreadPoolExecutor
 
 # === Secrets / Tokens ===
 HF_API_TOKEN = "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"
@@ -20,12 +21,13 @@ client = InferenceClient(token=HF_API_TOKEN)
 
 # === Models ===
 MODELS = {
-    "buy_recommendation": "fuchenru/Trading-Hero-LLM",
-    "price_transformer": "microsoft/ts-mbart-large"  # example transformer model
+    "buy_recommendation": "fuchenru/Trading-Hero-LLM"
 }
 
+# === Logging ===
 logging.basicConfig(level=logging.INFO)
 
+# === Load FinBERT Sentiment Model ===
 @st.cache_resource
 def load_sentiment_model():
     model_name = "ProsusAI/finbert"
@@ -43,31 +45,24 @@ def load_buy_rec_pipeline():
 buy_rec_pipeline = load_buy_rec_pipeline()
 
 ETF_SECTORS = {
-    'Tech': ["AAPL", "GOOG", "MSFT", "TSLA", "AMD", "NVDA", "INTC", "CRM", "ADBE", "AVGO", "ORCL", "CSCO", "QCOM", "NOW", "UBER", "SNOW", "TWLO", "WORK", "MDB", "ZI"],
-    'HealthCare': ["JNJ", "PFE", "MRK", "ABT", "GILD", "LLY", "BMY", "UNH", "AMGN", "CVS", "MDT", "ISRG", "ZTS", "REGN", "VRTX", "BIIB", "BAX", "HCA", "DGX", "IDXX"],
-    'Financials': ["JPM", "BAC", "C", "WFC", "GS", "MS", "USB", "AXP", "PNC", "SCHW", "BK", "BLK", "TFC", "CME", "MMC", "SPGI", "ICE", "STT", "FRC", "MTB"],
-    'ConsumerDiscretionary': ["AMZN", "TSLA", "HD", "MCD", "NKE", "SBUX", "LOW", "TJX", "GM", "F", "DG", "ROST", "CMG", "YUM", "DHI", "LEN", "BBY", "WHR", "LVS", "MAR"],
-    'Industrials': ["GE", "UPS", "CAT", "BA", "LMT", "MMM", "DE", "HON", "RTX", "GD", "EMR", "PNR", "ROK", "ETN", "CSX", "FDX", "CP", "XYL", "ITW", "DOV"],
-    'Energy': ["XOM", "CVX", "OXY", "SLB", "PXD", "EOG", "MPC", "VLO", "PSX", "COP", "HAL", "FTI", "BKR", "DVN", "CHK", "APA", "CXO", "MRO", "HES", "NBL"],
-    'Utilities': ["DUK", "SO", "NEE", "SRE", "EXC", "AEP", "XEL", "D", "ED", "PEG", "ES", "PPL", "WEC", "CMS", "EIX", "PNW", "FE", "ATO", "AES", "NRG"],
-    'BasicMaterials': ["LIN", "SHW", "ECL", "APD", "FCX", "NEM", "DD", "DOW", "CE", "PPG", "VMC", "LYB", "IP", "BLL", "MLM", "NUE", "PKG", "AVY", "PKX"],
-    'ETFs': ["SPY", "QQQ", "DIA", "IWM", "ARKK", "ARKW", "SMH", "IYT", "XLF", "XLE", "XLK", "XLY", "XLV", "XLI", "XLB", "XLU", "XLRE", "XLC", "VOO"],
-    'LeveragedETFs': ["TQQQ", "SQQQ", "SPXL", "SPXS", "UPRO", "SDOW", "SOXL", "SOXS", "LABU", "LABD", "FAS", "FAZ", "TNA", "TZA", "DRN", "DRV", "TECL", "TECS", "DFEN", "DUST"],
-    'Commodities': ["GC=F", "SI=F", "CL=F"]
+    'Tech': ["AAPL", "GOOG", "MSFT", "TSLA", "AMD", "NVDA", "INTC"],
+    'HealthCare': ["JNJ", "PFE", "MRK", "ABT"],
+    'Financials': ["JPM", "BAC", "C", "WFC"],
+    'Energy': ["XOM", "CVX", "SLB"]
 }
 
 def fetch_stock_data(ticker):
     try:
         stock = yf.Ticker(ticker)
-        hist = stock.history(period="30d")
+        hist = stock.history(period="1d")
         if hist.empty:
             raise ValueError("No historical data")
         price = hist['Close'].iloc[-1]
         volume = hist['Volume'].iloc[-1]
-        return {"price": price, "volume": volume, "history": hist}
+        return {"price": price, "volume": volume}
     except Exception as e:
         logging.error(f"Error fetching stock data for {ticker}: {e}")
-        return {"price": None, "volume": None, "history": None}
+        return {"price": None, "volume": None}
 
 def fetch_recent_headline(ticker):
     try:
@@ -109,7 +104,19 @@ def call_hf_model_buy(ticker):
 def calc_stop_loss(price):
     return round(price * 0.95, 2) if price else None
 
-# === LSTM Model for fallback price prediction ===
+def enhanced_buy_recommendation(pred_price, current_price, confidence, volume, model_label):
+    # Thresholds can be adjusted
+    if (
+        pred_price and current_price and
+        pred_price > current_price * 1.01 and
+        confidence >= 0.6 and
+        volume > 1_000_000 and
+        model_label.lower() in ['yes', 'buy', 'strong buy']
+    ):
+        return "Yes"
+    return "No"
+
+# === LSTM Model Definition for price prediction ===
 class StockPriceLSTM(nn.Module):
     def __init__(self, input_size=1, hidden_size=50, num_layers=2):
         super(StockPriceLSTM, self).__init__()
@@ -136,8 +143,12 @@ def prepare_data(df, sequence_length=20):
     X, y = np.array(X), np.array(y)
     return X, y, scaler
 
-def predict_price_lstm(df):
+def predict_price_lstm(ticker):
     try:
+        df = yf.Ticker(ticker).history(period="100d")
+        if df.empty or len(df) < 30:
+            return None
+
         X, y, scaler = prepare_data(df)
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -150,7 +161,7 @@ def predict_price_lstm(df):
         y_tensor = torch.tensor(y, dtype=torch.float32).to(device)
 
         model.train()
-        epochs = 30
+        epochs = 50
         for epoch in range(epochs):
             optimizer.zero_grad()
             outputs = model(X_tensor)
@@ -166,59 +177,46 @@ def predict_price_lstm(df):
         pred_price = scaler.inverse_transform(pred_scaled)[0][0]
         return round(float(pred_price), 2)
     except Exception as e:
-        logging.error(f"LSTM price prediction error: {e}")
+        logging.error(f"LSTM price prediction error for {ticker}: {e}")
         return None
 
-# === Hugging Face Time-Series Transformer Price Prediction ===
-def predict_price_transformer(ticker):
-    try:
-        # Get recent price history
-        df = yf.Ticker(ticker).history(period="30d")
-        if df.empty or len(df) < 20:
+# Cache the stock info processing for faster UI switching sectors
+@st.cache_data(show_spinner=False)
+def process_ticker_data(tickers):
+    results = []
+
+    def process(ticker):
+        stock = fetch_stock_data(ticker)
+        if not stock or stock['price'] is None:
             return None
+        headline = fetch_recent_headline(ticker)
+        sentiment, confidence = call_local_sentiment_with_score(headline)
+        pred_price = predict_price_lstm(ticker)
+        model_label = call_hf_model_buy(ticker)
+        buy = enhanced_buy_recommendation(pred_price, stock['price'], confidence, stock['volume'], model_label)
+        stop_loss = calc_stop_loss(stock['price'])
+        strong_signal = "✅" if buy == "Yes" else ""
 
-        # Prepare input sequence (just closing prices normalized)
-        close_prices = df['Close'].values[-20:]
-        min_p, max_p = close_prices.min(), close_prices.max()
-        norm_prices = (close_prices - min_p) / (max_p - min_p + 1e-9)
-
-        # The transformer expects input as list of floats
-        inputs = {
-            "inputs": norm_prices.tolist()
+        return {
+            "Ticker": ticker,
+            "Price": round(stock['price'], 2),
+            "Volume": int(stock['volume']) if stock['volume'] else 0,
+            "Predicted Price": pred_price if pred_price else "N/A",
+            "Headline": headline,
+            "Sentiment": sentiment,
+            "Confidence": confidence,
+            "Buy Recommendation": buy,
+            "Stop Loss": stop_loss,
+            "Strong Signal": strong_signal
         }
-        # Call Hugging Face inference API
-        response = client.text_generation(MODELS["price_transformer"], inputs)
-        # The model's output is expected as a predicted normalized price (float)
-        pred_norm_price = float(response.get('generated_text', '0').strip())
-        # Rescale back to original price range
-        pred_price = pred_norm_price * (max_p - min_p) + min_p
 
-        return round(pred_price, 2)
-    except Exception as e:
-        logging.error(f"Transformer price prediction error for {ticker}: {e}")
-        return None
-
-def aggregate_price_prediction(ticker):
-    data = fetch_stock_data(ticker)
-    df_hist = data.get("history")
-    if df_hist is None or len(df_hist) < 20:
-        return None
-    pred1 = predict_price_transformer(ticker)
-    pred2 = predict_price_lstm(df_hist)
-    preds = [p for p in [pred1, pred2] if p is not None]
-    if not preds:
-        return None
-    avg_pred = sum(preds) / len(preds)
-    return round(avg_pred, 2)
-
-def is_strong_signal(pred_price, current_price, buy_recommendation, confidence, volume):
-    return (
-        pred_price is not None and current_price is not None and
-        pred_price > current_price and
-        buy_recommendation.lower() == "yes" and
-        confidence >= 0.6 and
-        volume > 1_000_000
-    )
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        futures = [executor.submit(process, ticker) for ticker in tickers]
+        for future in futures:
+            res = future.result()
+            if res:
+                results.append(res)
+    return results
 
 def send_telegram_message(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -240,41 +238,20 @@ with tabs[0]:
     st.sidebar.markdown("Data powered by PyTorch FinBERT + HuggingFace + Yahoo Finance")
 
     tickers = ETF_SECTORS[sector]
-    results = []
-    with st.spinner("Processing data..."):
-        for ticker in tickers:
-            stock = fetch_stock_data(ticker)
-            if not stock or stock['price'] is None:
-                continue
-            headline = fetch_recent_headline(ticker)
-            sentiment, confidence = call_local_sentiment_with_score(headline)
-            pred_price = aggregate_price_prediction(ticker)
-            buy = call_hf_model_buy(ticker)
-            stop_loss = calc_stop_loss(stock['price'])
-            strong = "✅" if is_strong_signal(pred_price, stock['price'], buy, confidence, stock['volume']) else ""
+    with st.spinner("Processing data (this may take up to 30 seconds on first run)..."):
+        data = process_ticker_data(tickers)
 
-            results.append({
-                "Ticker": ticker,
-                "Price": round(stock['price'], 2),
-                "Volume": int(stock['volume']) if stock['volume'] else 0,
-                "Predicted Price": pred_price if pred_price else "N/A",
-                "Headline": headline,
-                "Sentiment": sentiment,
-                "Confidence": confidence,
-                "Buy Recommendation": buy,
-                "Stop Loss": stop_loss,
-                "Strong Signal": strong
-            })
-            time.sleep(0.5)
-
-    df = pd.DataFrame(results)
+    df = pd.DataFrame(data)
     if df.empty:
-        st.warning("No data available.")
+        st.warning("No data available for this sector.")
         st.stop()
 
     col1, col2 = st.columns(2)
-    col1.metric("✅ Strong Signals", df[df["Strong Signal"] == "✅"].shape[0])
-    col2.metric("Total Stocks", df.shape[0])
+    col1.metric("🟢 Buy Recommendations", df[df["Buy Recommendation"] == "Yes"].shape[0])
+    col2.metric("🔴 Not Buy", df[df["Buy Recommendation"] == "No"].shape[0])
+
+    def highlight_buy(val):
+        return "color: green; font-weight: bold" if val == "Yes" else "color: red; font-weight: bold"
 
     def highlight_signal(val):
         return "background-color: #c8f7c5; font-weight: bold" if val == "✅" else ""
@@ -288,6 +265,7 @@ with tabs[0]:
 
     styled_df = (
         df.style
+        .applymap(highlight_buy, subset=["Buy Recommendation"])
         .applymap(highlight_signal, subset=["Strong Signal"])
         .applymap(highlight_volume, subset=["Volume"])
         .format({
@@ -301,21 +279,66 @@ with tabs[0]:
 
     st.dataframe(styled_df, height=700)
 
-    if st.button("Send Top 5 Strong Signals to Telegram"):
-        top5 = df[df["Strong Signal"] == "✅"].sort_values(by="Confidence", ascending=False).head(5)
+    if st.button("Send Top 5 Buy Recommendations to Telegram"):
+        top5 = df[df["Buy Recommendation"] == "Yes"].sort_values(by="Confidence", ascending=False).head(5)
         if top5.empty:
-            st.warning("No strong signals to send.")
+            st.warning("No buy recommendations to send.")
         else:
-            lines = ["*Top 5 Strong Buy Signals:*"]
+            lines = ["*Top 5 Buy Recommendations:*"]
             for _, row in top5.iterrows():
-                lines.append(f"{row['Ticker']} | {row['Sentiment']} ({row['Confidence']*100:.1f}%) | Price: ${row['Price']} | Predicted: {row['Predicted Price']}")
-            msg = "\n".join(lines)
-            if send_telegram_message(msg):
+                lines.append(
+                    f"{row['Ticker']} | {row['Sentiment']} ({row['Confidence']*100:.1f}%) | "
+                    f"Price: ${row['Price']} | Predicted: {row['Predicted Price']}"
+                )
+            message = "\n".join(lines)
+            if send_telegram_message(message):
                 st.success("Telegram message sent.")
             else:
                 st.error("Failed to send message.")
 
     st.download_button("📥 Download Signals CSV", df.to_csv(index=False), "signals.csv")
+
+# --- Backtest tab ---
+def predict_price_lstm_backtest(ticker):
+    try:
+        df = yf.Ticker(ticker).history(period="120d")
+        if df.empty or len(df) < 40:
+            return None, None
+
+        X, y, scaler = prepare_data(df)
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        model = StockPriceLSTM()
+        model.to(device)
+        criterion = nn.MSELoss()
+        optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+
+        X_tensor = torch.tensor(X, dtype=torch.float32).to(device)
+        y_tensor = torch.tensor(y, dtype=torch.float32).to(device)
+
+        model.train()
+        for epoch in range(50):
+            optimizer.zero_grad()
+            outputs = model(X_tensor)
+            loss = criterion(outputs, y_tensor)
+            loss.backward()
+            optimizer.step()
+
+        model.eval()
+        with torch.no_grad():
+            predictions = model(X_tensor).cpu().numpy()
+            actuals = y_tensor.cpu().numpy()
+
+        predictions = np.array(predictions).reshape(-1, 1)
+        actuals = np.array(actuals).reshape(-1, 1)
+        pred_prices = scaler.inverse_transform(predictions)
+        actual_prices = scaler.inverse_transform(actuals)
+
+        accuracy = 100 - np.mean(np.abs(pred_prices - actual_prices) / actual_prices) * 100
+        return round(float(pred_prices[-1][0]), 2), round(accuracy, 2)
+
+    except Exception as e:
+        logging.error(f"Backtest error for {ticker}: {e}")
+        return None, None
 
 with tabs[1]:
     st.title("🔁 Backtest Accuracy")
@@ -325,19 +348,9 @@ with tabs[1]:
 
     with st.spinner("Running backtest predictions..."):
         for ticker in tickers_bt:
-            # Use LSTM for backtest accuracy for simplicity
-            df_hist = yf.Ticker(ticker).history(period="120d")
-            if df_hist.empty or len(df_hist) < 40:
-                continue
-            pred_price = predict_price_lstm(df_hist)
-            actual_price = df_hist['Close'].iloc[-1]
-            accuracy = 100 - abs(pred_price - actual_price) / actual_price * 100 if pred_price else 0
-            backtest_data.append({
-                "Ticker": ticker,
-                "Predicted Price": pred_price,
-                "Actual Price": round(actual_price, 2),
-                "Accuracy (%)": round(accuracy, 2)
-            })
+            pred_price, accuracy = predict_price_lstm_backtest(ticker)
+            if pred_price and accuracy:
+                backtest_data.append({"Ticker": ticker, "Predicted Price": pred_price, "Accuracy (%)": accuracy})
 
     if backtest_data:
         df_bt = pd.DataFrame(backtest_data)
