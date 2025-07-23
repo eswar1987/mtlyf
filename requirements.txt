@@ -1,5 +1,6 @@
 streamlit
-transformers
-requests
 pandas
-lxml
+yfinance
+requests
+numpy
+
