@@ -58,4 +58,53 @@ def process_ticker(ticker, data):
                 "Volume": volume,
                 "Stop Loss": stop_loss
             }
-    excep
+    except Exception:
+        return None
+
+def send_all_to_telegram(df):
+    lines = ["*Buy Recommendations:*"]
+    for _, row in df.iterrows():
+        lines.append(f"{row['Ticker']} | Current: ${row['Current Price']} | Predicted: ${row['Predicted Price']} | Confidence: {row['Confidence']*100:.1f}% | Volume: {row['Volume']:,} | Stop Loss: ${row['Stop Loss']}")
+    message = "\n".join(lines)
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    params = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
+    resp = requests.get(url, params=params)
+    if resp.status_code == 200:
+        st.success("Telegram alert sent successfully!")
+    else:
+        st.error(f"Failed to send Telegram alert: {resp.text}")
+
+# UI
+st.title("📈 Buy Recommendations Dashboard - Bulk Optimized")
+
+index_choice = st.selectbox("Select Index", ["S&P 500"])  # Add others similarly
+
+tickers = fetch_sp500()
+
+st.info(f"Loaded {len(tickers)} tickers for {index_choice}.")
+
+# Bulk download data
+data = fetch_bulk_stock_data(tickers)
+
+buy_reco_list = []
+
+with st.spinner("Processing buy recommendations in parallel..."):
+    with ThreadPoolExecutor(max_workers=15) as executor:
+        futures = {executor.submit(process_ticker, ticker, data): ticker for ticker in tickers}
+        for future in as_completed(futures):
+            result = future.result()
+            if result:
+                buy_reco_list.append(result)
+
+if not buy_reco_list:
+    st.warning("No buy recommendations found.")
+else:
+    df_buy = pd.DataFrame(buy_reco_list)
+    st.subheader("Buy Recommendations")
+    st.dataframe(df_buy)
+
+    csv_data = df_buy.to_csv(index=False).encode('utf-8')
+    st.download_button("Download Buy Recommendations CSV", csv_data, file_name="buy_recommendations.csv", mime="text/csv")
+
+    if st.button("Send All Buy Recommendations to Telegram"):
+        send_all_to_telegram(df_buy)
