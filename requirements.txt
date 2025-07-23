@@ -1,12 +1,13 @@
+streamlit
 streamlit-autorefresh
 matplotlib
+plotly
 yfinance
 pandas
+numpy
 requests
 huggingface-hub
-python-dotenv
-requests
-huggingface_hub
 transformers
 torch
 scikit-learn
+python-dotenv
