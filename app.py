@@ -1,22 +1,26 @@
 import streamlit as st
+from streamlit_autorefresh import st_autorefresh
+import matplotlib.pyplot as plt
+import plotly.graph_objects as go
 import yfinance as yf
 import pandas as pd
-import plotly.graph_objects as go
-from keras.models import load_model
 import numpy as np
-import datetime
+import requests
+from huggingface_hub import InferenceClient
+from transformers import pipeline
+import torch
+from sklearn.preprocessing import MinMaxScaler
+from tensorflow.keras.models import load_model
+import os
+from dotenv import load_dotenv
 
-st.set_page_config(layout="wide")
+load_dotenv()
 
-# Load model only once
-@st.cache_resource
-def load_lstm_model():
-    return load_model("lstm_model.keras")
+# Load your model if needed (e.g., LSTM model)
+# model = load_model("your_model.h5")
 
-model = load_lstm_model()
-
-# Sector-wise Ticker Mapping
-ETF_SECTORS = {
+# Define sectors and tickers
+SECTOR_TICKERS = {
     'Tech': ["AAPL", "GOOG", "MSFT", "TSLA", "AMD", "NVDA", "INTC", "CRM", "ADBE", "AVGO", "ORCL", "CSCO", "QCOM", "NOW", "UBER", "SNOW", "TWLO", "WORK", "MDB", "ZI"],
     'HealthCare': ["JNJ", "PFE", "MRK", "ABT", "GILD", "LLY", "BMY", "UNH", "AMGN", "CVS", "MDT", "ISRG", "ZTS", "REGN", "VRTX", "BIIB", "BAX", "HCA", "DGX", "IDXX"],
     'Financials': ["JPM", "BAC", "C", "WFC", "GS", "MS", "USB", "AXP", "PNC", "SCHW", "BK", "BLK", "TFC", "CME", "MMC", "SPGI", "ICE", "STT", "FRC", "MTB"],
@@ -30,67 +34,61 @@ ETF_SECTORS = {
     'Commodities': ["GC=F", "SI=F", "CL=F"]
 }
 
-INDIAN_STOCKS = {
-    "NSE Largecaps": ["RELIANCE.NS", "TCS.NS", "INFY.NS", "HDFCBANK.NS", "ICICIBANK.NS", "HINDUNILVR.NS", "SBIN.NS", "ITC.NS", "LT.NS", "AXISBANK.NS"],
-    "NSE Midcaps": ["BEL.NS", "IRCTC.NS", "TATAELXSI.NS", "ZEEL.NS", "TATAPOWER.NS", "CUMMINSIND.NS", "UBL.NS", "BALKRISIND.NS", "GUJGASLTD.NS", "INDHOTEL.NS"]
-}
+# UI selection
+st.title("📈 Multi-Sector Stock Dashboard")
+sector = st.sidebar.selectbox("Select Sector", list(SECTOR_TICKERS.keys()))
+tickers = SECTOR_TICKERS[sector]
 
-# Utility functions
-def fetch_stock_data(ticker):
-    df = yf.download(ticker, period="6mo", interval="1d")
-    if df.empty or len(df) < 60:
-        return None
-    df['Return'] = df['Close'].pct_change()
-    df['Volume_Change'] = df['Volume'].pct_change()
-    df.dropna(inplace=True)
-    return df
+selected_ticker = st.selectbox("Select Ticker", tickers)
 
-def predict_price_lstm(df):
-    data = df[['Close']].values[-60:]
-    scaled = (data - np.mean(data)) / np.std(data)
-    X = np.reshape(scaled, (1, 60, 1))
-    pred = model.predict(X)[0][0]
-    prediction = (pred * np.std(data)) + np.mean(data)
-    return round(prediction, 2)
+# Fetch live stock data
+def fetch_data(ticker):
+    try:
+        df = yf.download(ticker, period="5d", interval="30m")
+        df.dropna(inplace=True)
+        return df
+    except Exception as e:
+        st.error(f"Error fetching data for {ticker}: {e}")
+        return pd.DataFrame()
 
-def process_sector(ticker_list):
-    result = []
-    for ticker in ticker_list:
-        df = fetch_stock_data(ticker)
-        if df is None:
-            continue
-        current = round(df['Close'].iloc[-1], 2)
-        predicted = predict_price_lstm(df)
-        confidence = np.random.randint(85, 99)
-        volume = int(df['Volume'].iloc[-1])
-        avg_volume = int(df['Volume'].rolling(10).mean().iloc[-1])
-        high_volume = volume > avg_volume * 1.2
-        recommendation = "YES" if predicted > current and confidence > 92 and high_volume else "NO"
-        result.append({"Ticker": ticker, "Current Price": current, "Predicted Price": predicted, "Confidence": confidence, "Volume": volume, "Buy Recommendation": recommendation})
-    return pd.DataFrame(result)
+def show_chart(df, ticker):
+    fig = go.Figure(data=[
+        go.Candlestick(
+            x=df.index,
+            open=df['Open'],
+            high=df['High'],
+            low=df['Low'],
+            close=df['Close']
+        )
+    ])
+    fig.update_layout(title=f"Candlestick Chart: {ticker}", xaxis_title="Time", yaxis_title="Price")
+    st.plotly_chart(fig, use_container_width=True)
 
-# UI Layout
-st.title("📊 Stock Forecast & Backtesting Dashboard")
+# Buy recommendation logic
+def should_buy(predicted_price, current_price, confidence, volume):
+    if predicted_price > current_price and confidence > 0.92 and volume > 1e6:
+        return "✅ Yes"
+    return "❌ No"
 
-country = st.sidebar.radio("Select Market", ["US", "India"])
-sector_dict = ETF_SECTORS if country == "US" else INDIAN_STOCKS
+# Simulated prediction and confidence (replace with real model or API)
+def simulate_prediction(ticker):
+    pred_price = round(np.random.uniform(0.95, 1.10) * yf.Ticker(ticker).info['previousClose'], 2)
+    confidence = round(np.random.uniform(0.88, 0.99), 4)
+    volume = yf.Ticker(ticker).info.get('volume', 0)
+    return pred_price, confidence, volume
 
-menu = st.sidebar.radio("Navigation", ["📈 Forecast Dashboard", "🔁 Backtest"])
+# Display logic
+st.subheader(f"🔍 Analysis for {selected_ticker}")
+data = fetch_data(selected_ticker)
+if not data.empty:
+    show_chart(data, selected_ticker)
 
-if menu == "📈 Forecast Dashboard":
-    sector = st.sidebar.selectbox("Select Sector", options=list(sector_dict.keys()))
-    with st.spinner("Processing data..."):
-        data = process_sector(sector_dict[sector])
-    if not data.empty:
-        st.dataframe(data, use_container_width=True)
-    else:
-        st.warning("No data available for this sector.")
+    current_price = data.iloc[-1]['Close']
+    pred_price, confidence, volume = simulate_prediction(selected_ticker)
 
-elif menu == "🔁 Backtest":
-    sector_bt = st.selectbox("Select Sector to Backtest", list(sector_dict.keys()), key="backtest_sector")
-    tickers_bt = sector_dict[sector_bt]
-    bt_results = process_sector(tickers_bt)
-    if not bt_results.empty:
-        st.dataframe(bt_results, use_container_width=True)
-    else:
-        st.warning("No data available for backtest.")
+    st.metric("📌 Current Price", f"${current_price:.2f}")
+    st.metric("🔮 Predicted Price", f"${pred_price:.2f}")
+    st.metric("🎯 Confidence", f"{confidence * 100:.2f}%")
+    st.metric("📊 Volume", f"{volume:,}")
+
+    st.success(f"Buy Recommendation: {should_buy(pred_price, current_price, confidence, volume)}")
