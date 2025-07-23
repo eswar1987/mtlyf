@@ -11,3 +11,4 @@ transformers
 torch
 scikit-learn
 python-dotenv
+tensorflow
