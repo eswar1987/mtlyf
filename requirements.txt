@@ -1,12 +1,5 @@
-streamlit-autorefresh
-matplotlib
-yfinance
-pandas
-requests
-huggingface-hub
-python-dotenv
-requests
-huggingface_hub
+streamlit
 transformers
-torch
-scikit-learn
+requests
+pandas
+lxml
