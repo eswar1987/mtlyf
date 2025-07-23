@@ -2,94 +2,65 @@ import streamlit as st
 import pandas as pd
 import yfinance as yf
 import requests
+import numpy as np
 import time
 
-# --- Fetch NSE Nifty 50 tickers dynamically ---
+st.set_page_config(page_title="Buy Recommendations Dashboard", layout="wide")
+
+# Telegram credentials
+TELEGRAM_BOT_TOKEN = "7842285230:AAFcisrfFg40AqYjvrGaiq984DYeEu3p6hY"
+TELEGRAM_CHAT_ID = "7581145756"
+
+# --- Helper to fetch NSE Nifty 50 tickers from official CSV (with headers) ---
 @st.cache_data(ttl=86400)
 def fetch_nifty_50():
-    url = "https://www.moneycontrol.com/markets/indian-indices/top-nse-50-companies-list/9"
-    tables = pd.read_html(url)
-    # Find the right table and column
-    for table in tables:
-        # Look for column with "Company" or "Name" or "Symbol"
-        cols = table.columns.str.lower()
-        if any(col in cols for col in ['company', 'name', 'symbol']):
-            # Prefer "Company" or "Name" column
-            if 'Company' in table.columns:
-                companies = table['Company'].tolist()
-            elif 'Name' in table.columns:
-                companies = table['Name'].tolist()
-            elif 'Symbol' in table.columns:
-                companies = table['Symbol'].tolist()
-            else:
-                companies = []
-            # Some rows might be NaN, filter
-            companies = [str(c).strip() for c in companies if pd.notna(c)]
-            return companies
-    return []
-
-# --- Fetch NSE Nifty Smallcap 100 tickers dynamically ---
-@st.cache_data(ttl=86400)
-def fetch_nifty_smallcap_100():
-    url = "https://www.nseindia.com/api/equity-stockIndices?index=NIFTY%20Smallcap%20100"
+    url = "https://archives.nseindia.com/content/indices/ind_nifty50list.csv"
     headers = {
         "User-Agent": "Mozilla/5.0"
     }
     try:
-        r = requests.get(url, headers=headers)
-        r.raise_for_status()
-        data = r.json()
-        symbols = [item['symbol'] for item in data['data']]
+        response = requests.get(url, headers=headers)
+        response.raise_for_status()
+        df = pd.read_csv(pd.compat.StringIO(response.text))
+        # Columns have 'Symbol' column
+        symbols = df['Symbol'].tolist()
+        symbols = [sym.strip() + ".NS" for sym in symbols]  # Add .NS suffix for yfinance NSE tickers
         return symbols
     except Exception as e:
-        st.warning(f"Failed to fetch Nifty Smallcap 100: {e}")
+        st.warning(f"Failed to fetch Nifty 50: {e}")
         return []
 
 # --- Fetch S&P 500 tickers from Wikipedia ---
 @st.cache_data(ttl=86400)
 def fetch_sp500():
     url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-    tables = pd.read_html(url)
-    # Table usually at index 0, column "Symbol"
-    df = tables[0]
-    if 'Symbol' in df.columns:
+    try:
+        tables = pd.read_html(url)
+        df = tables[0]
         symbols = df['Symbol'].tolist()
-        symbols = [s.replace('.', '-') for s in symbols]  # yfinance uses '-' instead of '.'
+        symbols = [s.replace('.', '-') for s in symbols]
         return symbols
-    return []
+    except Exception as e:
+        st.warning(f"Failed to fetch S&P 500: {e}")
+        return []
 
 # --- Fetch Nasdaq 100 tickers from Wikipedia ---
 @st.cache_data(ttl=86400)
 def fetch_nasdaq_100():
     url = "https://en.wikipedia.org/wiki/Nasdaq-100"
-    tables = pd.read_html(url)
-    for table in tables:
-        if 'Ticker' in table.columns:
-            symbols = table['Ticker'].tolist()
-            symbols = [s.replace('.', '-') for s in symbols]
-            return symbols
-    return []
+    try:
+        tables = pd.read_html(url)
+        for table in tables:
+            if 'Ticker' in table.columns:
+                symbols = table['Ticker'].tolist()
+                symbols = [s.replace('.', '-') for s in symbols]
+                return symbols
+        return []
+    except Exception as e:
+        st.warning(f"Failed to fetch Nasdaq 100: {e}")
+        return []
 
-# --- Main app ---
-st.title("📈 Dynamic NSE & US Stock Dashboards")
-
-index_options = {
-    "Nifty 50": fetch_nifty_50,
-    "Nifty Smallcap 100": fetch_nifty_smallcap_100,
-    "S&P 500": fetch_sp500,
-    "Nasdaq 100": fetch_nasdaq_100
-}
-
-index_choice = st.selectbox("Select Index", list(index_options.keys()))
-
-tickers = index_options[index_choice]()
-
-if not tickers:
-    st.warning(f"Could not load tickers for {index_choice}.")
-    st.stop()
-
-selected_ticker = st.selectbox(f"Select Ticker from {index_choice}", tickers)
-
+# --- Fetch stock data ---
 @st.cache_data(ttl=3600)
 def fetch_stock_data(ticker):
     try:
@@ -101,55 +72,99 @@ def fetch_stock_data(ticker):
     except Exception:
         return None
 
-data = fetch_stock_data(selected_ticker)
-
-if data is None or data.empty:
-    st.warning(f"No data found for {selected_ticker}.")
-else:
-    st.line_chart(data['Close'])
-
-# Simulate buy recommendation (replace with your real logic)
+# Buy recommendation logic
 def buy_recommendation(predicted_price, current_price, confidence, volume):
     if predicted_price > current_price and confidence > 0.92 and volume > 1_000_000:
-        return "Yes"
-    return "No"
+        return True
+    return False
 
-# Dummy prediction values for demonstration
-import numpy as np
-current_price = data['Close'][-1]
-predicted_price = current_price * np.random.uniform(1.01, 1.10)
-confidence = np.random.uniform(0.90, 0.99)
-volume = yf.Ticker(selected_ticker).info.get('volume', 0)
+# Calculate stop loss (5% below current price)
+def calc_stop_loss(price):
+    return round(price * 0.95, 2)
 
-st.metric("Current Price", f"${current_price:.2f}")
-st.metric("Predicted Price", f"${predicted_price:.2f}")
-st.metric("Confidence", f"{confidence*100:.2f}%")
-st.metric("Volume", f"{volume:,}")
+# Simulate prediction for demo (replace with your real model or API)
+def simulate_prediction(ticker):
+    current_price = yf.Ticker(ticker).info.get('previousClose', None)
+    if current_price is None:
+        return None, None, None
+    pred_price = round(current_price * np.random.uniform(1.01, 1.10), 2)
+    confidence = np.random.uniform(0.90, 0.99)
+    volume = yf.Ticker(ticker).info.get('volume', 0)
+    return pred_price, confidence, volume
 
-rec = buy_recommendation(predicted_price, current_price, confidence, volume)
-st.success(f"Buy Recommendation: {rec}")
+# Fetch index tickers dynamically
+INDEX_FUNCTIONS = {
+    "Nifty 50": fetch_nifty_50,
+    "S&P 500": fetch_sp500,
+    "Nasdaq 100": fetch_nasdaq_100
+}
 
-# Telegram alert button
-TELEGRAM_BOT_TOKEN = "7842285230:AAFcisrfFg40AqYjvrGaiq984DYeEu3p6hY"
-TELEGRAM_CHAT_ID = "7581145756"
+st.title("📈 Buy Recommendations Dashboard")
 
-def send_telegram_message(message):
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    params = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message,
-        "parse_mode": "Markdown"
-    }
-    try:
-        r = requests.get(url, params=params)
-        return r.status_code == 200
-    except Exception as e:
-        st.error(f"Telegram send error: {e}")
-        return False
+index_choice = st.selectbox("Select Index", list(INDEX_FUNCTIONS.keys()))
+tickers = INDEX_FUNCTIONS[index_choice]()
 
-if st.button("Send Buy Recommendation to Telegram"):
-    msg = f"*Stock Buy Recommendation*\n\nTicker: {selected_ticker}\nCurrent Price: ${current_price:.2f}\nPredicted Price: ${predicted_price:.2f}\nConfidence: {confidence*100:.2f}%\nVolume: {volume:,}\nRecommendation: {rec}"
-    if send_telegram_message(msg):
-        st.success("Telegram alert sent successfully!")
-    else:
-        st.error("Failed to send Telegram alert.")
+if not tickers:
+    st.error(f"Failed to load tickers for {index_choice}.")
+    st.stop()
+
+st.info(f"Loaded {len(tickers)} tickers for {index_choice}.")
+
+# Process tickers and filter only buy recommendations
+buy_reco_list = []
+with st.spinner(f"Processing {len(tickers)} tickers for buy recommendations..."):
+    for i, ticker in enumerate(tickers):
+        stock_data = fetch_stock_data(ticker)
+        if stock_data is None or stock_data.empty:
+            continue
+
+        current_price = stock_data['Close'][-1]
+
+        pred_price, confidence, volume = simulate_prediction(ticker)
+        if pred_price is None:
+            continue
+
+        if buy_recommendation(pred_price, current_price, confidence, volume):
+            stop_loss = calc_stop_loss(current_price)
+            buy_reco_list.append({
+                "Ticker": ticker,
+                "Current Price": round(current_price, 2),
+                "Predicted Price": pred_price,
+                "Confidence": round(confidence, 2),
+                "Volume": volume,
+                "Stop Loss": stop_loss
+            })
+
+        # small delay to avoid API throttling
+        time.sleep(0.1)
+
+if not buy_reco_list:
+    st.warning("No buy recommendations found for the selected index.")
+else:
+    df_buy = pd.DataFrame(buy_reco_list)
+    st.subheader("Buy Recommendations")
+    st.dataframe(df_buy)
+
+    # CSV download button
+    csv_data = df_buy.to_csv(index=False).encode('utf-8')
+    st.download_button(label="Download Buy Recommendations CSV", data=csv_data, file_name=f"buy_recommendations_{index_choice}.csv", mime="text/csv")
+
+    # Telegram message formatting and sending
+    def send_all_to_telegram(df):
+        lines = ["*Buy Recommendations:*"]
+        for _, row in df.iterrows():
+            lines.append(f"{row['Ticker']} | Current: ${row['Current Price']} | Predicted: ${row['Predicted Price']} | Confidence: {row['Confidence']*100:.1f}% | Volume: {row['Volume']:,} | Stop Loss: ${row['Stop Loss']}")
+        message = "\n".join(lines)
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        params = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
+        try:
+            resp = requests.get(url, params=params)
+            if resp.status_code == 200:
+                st.success("Telegram alert sent successfully!")
+            else:
+                st.error(f"Failed to send Telegram alert: {resp.text}")
+        except Exception as e:
+            st.error(f"Error sending Telegram alert: {e}")
+
+    if st.button("Send All Buy Recommendations to Telegram"):
+        send_all_to_telegram(df_buy)
