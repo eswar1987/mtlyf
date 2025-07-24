@@ -1,165 +1,182 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import requests
 import yfinance as yf
+import requests
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from transformers import pipeline
+from tensorflow.keras.models import load_model
+from sklearn.preprocessing import MinMaxScaler
+
+# Load your LSTM model (make sure model.h5 is in your folder)
+@st.cache_resource
+def load_price_model():
+    return load_model("model.h5")
+
+price_model = load_price_model()
+
+# Load sentiment pipeline (FinBERT or generic sentiment model)
+@st.cache_resource
+def load_sentiment_pipeline():
+    return pipeline("sentiment-analysis", model="yiyanghkust/finbert-tone")
+
+sentiment_analyzer = load_sentiment_pipeline()
+
+# Preprocessing scaler for price input
+scaler = MinMaxScaler(feature_range=(0, 1))
+
+# News API config
+NEWS_API_KEY = "745d4e372a4848fca701b7d5d6787bec"
+NEWS_ENDPOINT = "https://newsapi.org/v2/everything"
 
 # Telegram config
 TELEGRAM_BOT_TOKEN = "7842285230:AAFcisrfFg40AqYjvrGaiq984DYeEu3p6hY"
 TELEGRAM_CHAT_ID = "7581145756"
 
-# Cache tickers for 24 hours
-@st.cache_data(ttl=86400)
-def fetch_nifty50_tickers():
-    url = "https://hi-imcodeman.github.io/stock-nse-india/classes/index.nseindia.html#getallstocksymbols"
+# Fetch news headlines for ticker
+def fetch_news(ticker, max_articles=5):
+    params = {
+        'q': ticker,
+        'apiKey': NEWS_API_KEY,
+        'language': 'en',
+        'sortBy': 'relevance',
+        'pageSize': max_articles
+    }
     try:
-        resp = requests.get(url, timeout=10)
-        resp.raise_for_status()
-        data = resp.json()
-        # Filter symbols in Nifty 50 group
-        nifty_50_symbols = [item['symbol'] + ".NS" for item in data if item.get('index') == "NIFTY 50"]
-        if not nifty_50_symbols:
-            # Fallback list if empty
-            nifty_50_symbols = [
-                "RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "INFY.NS", "HINDUNILVR.NS",
-                "ICICIBANK.NS", "KOTAKBANK.NS", "SBIN.NS", "BHARTIARTL.NS", "HDFC.NS"
-            ]
-        return nifty_50_symbols
+        response = requests.get(NEWS_ENDPOINT, params=params)
+        articles = response.json().get('articles', [])
+        headlines = [article['title'] for article in articles]
+        return headlines
     except Exception as e:
-        st.error(f"Error fetching Nifty 50 tickers: {e}")
-        return [
-            "RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "INFY.NS", "HINDUNILVR.NS",
-            "ICICIBANK.NS", "KOTAKBANK.NS", "SBIN.NS", "BHARTIARTL.NS", "HDFC.NS"
-        ]
+        st.error(f"News fetch error: {e}")
+        return []
 
-@st.cache_data(ttl=86400)
-def fetch_sp500_tickers():
-    url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-    try:
-        tables = pd.read_html(url)
-        df = tables[0]
-        return df['Symbol'].tolist()
-    except Exception as e:
-        st.error(f"Failed to fetch S&P 500 tickers: {e}")
-        return ['AAPL', 'MSFT', 'AMZN', 'GOOGL', 'FB']
+# Get average sentiment score of headlines
+def analyze_sentiment(headlines):
+    if not headlines:
+        return None, "No news"
+    results = sentiment_analyzer(headlines)
+    # FinBERT returns labels: Positive, Neutral, Negative; map them to scores
+    label_map = {"Positive":1, "Neutral":0.5, "Negative":0}
+    scores = [label_map.get(r['label'], 0.5) for r in results]
+    avg_score = np.mean(scores)
+    return avg_score, results
 
-@st.cache_data(ttl=86400)
-def fetch_nasdaq100_tickers():
-    url = "https://en.wikipedia.org/wiki/NASDAQ-100"
-    try:
-        tables = pd.read_html(url)
-        df = tables[3]
-        return df['Ticker'].tolist()
-    except Exception as e:
-        st.error(f"Failed to fetch Nasdaq 100 tickers: {e}")
-        return ['AAPL', 'MSFT', 'AMZN', 'GOOGL', 'TSLA']
+# Prepare data for price prediction - example: last 60 days close
+def prepare_price_data(ticker, days=60):
+    df = yf.download(ticker, period=f"{days}d", interval="1d")
+    if df.empty or 'Close' not in df.columns:
+        return None
+    close_prices = df['Close'].values.reshape(-1,1)
+    scaled = scaler.fit_transform(close_prices)
+    # Model expects (1,60,1) shape
+    if len(scaled) < days:
+        return None
+    input_data = scaled[-days:].reshape(1, days, 1)
+    return input_data, close_prices[-1][0]
 
-# Fetch stock info concurrently for speed
-def fetch_stock_info_concurrent(tickers):
-    results = []
+# Predict next day price using LSTM
+def predict_price(ticker):
+    data = prepare_price_data(ticker)
+    if data is None:
+        return None, None
+    input_data, last_price = data
+    pred_scaled = price_model.predict(input_data)[0][0]
+    # Reverse scale prediction (approximate)
+    pred_price = scaler.inverse_transform([[pred_scaled]])[0][0]
+    confidence = 0.95  # you can build a better confidence measure
+    return pred_price, confidence
 
-    def fetch_one(ticker):
-        try:
-            stock = yf.Ticker(ticker)
-            hist = stock.history(period="1d")
-            price = hist['Close'].iloc[-1] if not hist.empty else None
-            volume = hist['Volume'].iloc[-1] if not hist.empty else None
-            confidence = np.random.uniform(0.85, 0.99)  # Fake confidence for demo
-            return ticker, price, volume, confidence
-        except Exception:
-            return ticker, None, None, 0.0
+# Buy recommendation combining price & sentiment
+def combined_buy_recommendation(current_price, predicted_price, confidence, sentiment_score, volume):
+    if current_price is None or predicted_price is None:
+        return "No"
+    # Basic logic: price up, confidence high, positive sentiment and volume high
+    if (
+        predicted_price > current_price and
+        confidence > 0.9 and
+        sentiment_score is not None and sentiment_score > 0.6 and
+        volume > 1_000_000
+    ):
+        return "Yes"
+    return "No"
 
-    with ThreadPoolExecutor(max_workers=10) as executor:
-        future_to_ticker = {executor.submit(fetch_one, t): t for t in tickers}
-        for future in as_completed(future_to_ticker):
-            ticker, price, volume, confidence = future.result()
-            results.append({
-                'Ticker': ticker,
-                'Price': price,
-                'Volume': volume,
-                'Confidence': confidence
-            })
-    return results
-
-def buy_recommendation(price, predicted_price, confidence, volume):
-    if predicted_price and price and predicted_price > price and confidence > 0.92 and volume and volume > 1_000_000:
-        return True
-    return False
-
-def calc_stop_loss(price):
-    if price:
-        return round(price * 0.95, 2)
-    return None
-
-# For simplicity, simulated predicted price as +5% over current price
-def simulate_predicted_price(price):
-    if price:
-        return round(price * 1.05, 2)
-    return None
-
-def send_telegram_message(text):
+# Telegram message
+def send_telegram_message(message: str) -> bool:
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    params = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"}
+    params = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
     try:
-        resp = requests.get(url, params=params)
-        return resp.status_code == 200
+        r = requests.get(url, params=params)
+        return r.status_code == 200
     except Exception as e:
-        st.error(f"Telegram send error: {e}")
+        st.error(f"Telegram error: {e}")
         return False
 
-# --- Streamlit App ---
-st.title("📈 Buy Recommendations Dashboard with Fast Data Fetch")
+# Main app
+st.title("📊 Real ML + Sentiment Stock Dashboard")
 
-index_option = st.selectbox("Select Index:", ["Nifty 50", "S&P 500", "Nasdaq 100"])
+# Choose index & fetch tickers (reuse your previous fetch functions)
 
-if index_option == "Nifty 50":
-    tickers = fetch_nifty50_tickers()
-elif index_option == "S&P 500":
-    tickers = fetch_sp500_tickers()
-else:
-    tickers = fetch_nasdaq100_tickers()
+index_option = st.selectbox("Select Index", ["S&P 500", "Nifty 50", "Nasdaq 100"])
+tickers = []  # fetch your tickers dynamically or static
 
-st.write(f"Total tickers fetched: {len(tickers)}")
+# For demo, small list:
+tickers = ["AAPL", "MSFT", "RELIANCE.NS"]
 
-with st.spinner("Fetching stock data..."):
-    stocks_data = fetch_stock_info_concurrent(tickers)
+max_tickers = st.sidebar.slider("Max tickers to scan", 5, 30, 10)
+tickers = tickers[:max_tickers]
 
-# Compute buy recommendations
-buy_recos = []
-for stock in stocks_data:
-    ticker = stock['Ticker']
-    price = stock['Price']
-    volume = stock['Volume']
-    confidence = stock['Confidence']
-    pred_price = simulate_predicted_price(price)
-    if buy_recommendation(price, pred_price, confidence, volume):
-        buy_recos.append({
+results = []
+progress_bar = st.progress(0)
+status_text = st.empty()
+
+for i, ticker in enumerate(tickers):
+    current_price, volume = fetch_stock_data(ticker)
+    if current_price is None:
+        continue
+
+    pred_price, confidence = predict_price(ticker)
+    headlines = fetch_news(ticker)
+    sentiment_score, sentiment_results = analyze_sentiment(headlines)
+    buy = combined_buy_recommendation(current_price, pred_price, confidence, sentiment_score, volume)
+
+    if buy == "Yes":
+        stop_loss = round(current_price * 0.95, 2)
+        results.append({
             "Ticker": ticker,
-            "Current Price": price,
+            "Current Price": current_price,
             "Predicted Price": pred_price,
-            "Confidence": round(confidence, 3),
+            "Confidence": confidence,
+            "Sentiment Score": sentiment_score,
             "Volume": volume,
-            "Stop Loss": calc_stop_loss(price)
+            "Stop Loss": stop_loss,
+            "News Headlines": headlines[:3]
         })
 
-if not buy_recos:
-    st.warning("No buy recommendations at this time.")
+    status_text.text(f"Processed {i+1}/{len(tickers)} tickers")
+    progress_bar.progress((i+1)/len(tickers))
+    time.sleep(1)
+
+progress_bar.empty()
+status_text.empty()
+
+if not results:
+    st.warning("No buy recommendations found.")
 else:
-    df_buys = pd.DataFrame(buy_recos)
-    st.dataframe(df_buys)
+    df = pd.DataFrame(results)
+    st.dataframe(df)
 
-    csv = df_buys.to_csv(index=False).encode('utf-8')
-    st.download_button("📥 Download Buy Recommendations CSV", data=csv, file_name="buy_recommendations.csv")
+    csv = df.to_csv(index=False).encode()
+    st.download_button("Download CSV", csv, "buy_recommendations.csv")
 
-    if st.button("🚀 Send Buy Recommendations to Telegram"):
-        msg_lines = ["*Buy Recommendations:*"]
-        for r in buy_recos:
-            msg_lines.append(f"{r['Ticker']} | Price: ${r['Current Price']:.2f} | Predicted: ${r['Predicted Price']:.2f} | Confidence: {r['Confidence']*100:.1f}% | Stop Loss: ${r['Stop Loss']}")
-        message = "\n".join(msg_lines)
-        success = send_telegram_message(message)
-        if success:
-            st.success("Telegram alert sent!")
+    if st.button("Send to Telegram"):
+        lines = ["*Buy Recommendations:*"]
+        for _, row in df.iterrows():
+            lines.append(
+                f"{row['Ticker']} | Price: ${row['Current Price']:.2f} | Predicted: ${row['Predicted Price']:.2f} | Conf: {row['Confidence']*100:.1f}% | Sentiment: {row['Sentiment Score']:.2f} | Stop Loss: ${row['Stop Loss']:.2f}"
+            )
+        message = "\n".join(lines)
+        if send_telegram_message(message):
+            st.success("Telegram message sent!")
         else:
-            st.error("Failed to send Telegram alert.")
+            st.error("Failed to send Telegram message.")
