@@ -1,9 +1,9 @@
 streamlit
+yfinance
 pandas
 numpy
 requests
-yfinance
-torch
-transformers
+tensorflow
 scikit-learn
-bs4
+transformers
+torch
