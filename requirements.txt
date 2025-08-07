@@ -11,4 +11,5 @@ transformers
 torch
 scikit-learn
 tensorflow-cpu
+tensorflow-cpu==2.13.0  # ✅ Add this for Keras/TensorFlow support
 
