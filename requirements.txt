@@ -10,4 +10,5 @@ huggingface_hub
 transformers
 torch
 scikit-learn
+tensorflow-cpu
 
